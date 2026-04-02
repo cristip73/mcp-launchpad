@@ -49,12 +49,20 @@ def _parse_flag_args(args: tuple[str, ...]) -> str:
         if arg.startswith("--") and i + 1 < len(args):
             key = arg[2:]  # strip --
             value: Any = args[i + 1]
-            # Try to parse as boolean; keep everything else as string
-            # (avoids int/float coercion issues with IDs, dates, etc.)
+            # Try to parse as boolean or short number; keep long numbers as
+            # strings (likely IDs, account numbers, dates, etc.)
             if value.lower() == "true":
                 value = True
             elif value.lower() == "false":
                 value = False
+            elif len(value) <= 4:
+                try:
+                    value = int(value)
+                except ValueError:
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
             result[key] = value
             i += 2
         else:
@@ -575,11 +583,23 @@ def call(
     if stdin:
         arguments = sys.stdin.read()
     elif extra_args:
-        # Check if it's a single JSON argument
-        if len(extra_args) == 1 and extra_args[0].startswith("{"):
+        has_json = any(a.startswith("{") for a in extra_args)
+        has_flags = any(a.startswith("--") for a in extra_args)
+
+        if has_json and has_flags:
+            output.error(
+                ValueError("Cannot mix JSON and --key value syntax"),
+                error_type="ArgumentParseError",
+                help_text=(
+                    "Use one style:\n"
+                    '  mcpl call server tool \'{"key": "value"}\'\n'
+                    "  mcpl call server tool --key value"
+                ),
+            )
+            return
+        elif has_json and len(extra_args) == 1:
             arguments = extra_args[0]
-        # Check if it looks like --key value pairs
-        elif extra_args[0].startswith("--"):
+        elif has_flags:
             arguments = _parse_flag_args(extra_args)
         else:
             # Try joining as JSON (e.g. split by shell)
