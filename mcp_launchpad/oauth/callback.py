@@ -218,16 +218,19 @@ class LocalhostCallbackServer:
             result = await server.wait_for_callback()
     """
 
-    def __init__(self, timeout: int = DEFAULT_TIMEOUT, path: str = "/callback"):
+    def __init__(self, timeout: int = DEFAULT_TIMEOUT, path: str = "/callback", port: int = 0, host: str = "127.0.0.1"):
         """Initialize callback server.
 
         Args:
             timeout: Timeout in seconds to wait for callback
             path: URL path to listen on (default "/callback")
+            port: Fixed port to use (0 = let OS assign)
+            host: Host to bind to and use in redirect URI
         """
         self.timeout = timeout
         self.path = path
-        self.port: int = 0
+        self.port: int = port
+        self.host: str = host
         self.redirect_uri: str = ""
 
         self._server: asyncio.Server | None = None
@@ -245,11 +248,12 @@ class LocalhostCallbackServer:
         """
         self._result_event = asyncio.Event()
 
-        # Use port=0 to let OS assign an available port atomically
+        # Use specified port or port=0 to let OS assign an available port
+        bind_port = self.port or 0
         self._server = await asyncio.start_server(
             self._handle_connection,
             "127.0.0.1",
-            0,  # Let OS assign available port
+            bind_port,
         )
 
         # Get the actual port assigned by the OS
@@ -258,7 +262,7 @@ class LocalhostCallbackServer:
             raise CallbackError("Failed to start callback server: no sockets created")
 
         self.port = sockets[0].getsockname()[1]
-        self.redirect_uri = f"http://127.0.0.1:{self.port}{self.path}"
+        self.redirect_uri = f"http://{self.host}:{self.port}{self.path}"
 
         logger.debug(f"Callback server started on {self.redirect_uri}")
         return self.redirect_uri

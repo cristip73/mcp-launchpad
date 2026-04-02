@@ -678,6 +678,7 @@ def _handle_oauth_required_servers(
                     client_id=server_config.get_resolved_oauth_client_id(),
                     client_secret=server_config.get_resolved_oauth_client_secret(),
                     scopes=server_config.oauth_scopes or None,
+                    callback_port=server_config.oauth_callback_port or 0,
                     on_status=on_status,
                 )
             )
@@ -1130,6 +1131,7 @@ def auth_login(
                 client_secret=config_client_secret,
                 scopes=scopes,
                 callback_timeout=timeout,
+                callback_port=server_config.oauth_callback_port or 0,
                 on_status=on_status,
                 prompt_for_credentials=prompt_for_credentials,
             )

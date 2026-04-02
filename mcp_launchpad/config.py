@@ -58,6 +58,8 @@ class ServerConfig:
     oauth_client_id: str | None = None
     oauth_client_secret: str | None = None
     oauth_scopes: list[str] = field(default_factory=list)
+    # OAuth callback port (fixed port for pre-registered apps like Slack)
+    oauth_callback_port: int | None = None
     # Static API key (alternative to OAuth for agent-friendly auth)
     api_key: str | None = None
 
@@ -290,10 +292,11 @@ def parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         server_type=server_type,
         url=data.get("url", ""),
         headers=data.get("headers", {}),
-        # OAuth fields
-        oauth_client_id=data.get("oauth_client_id"),
-        oauth_client_secret=data.get("oauth_client_secret"),
-        oauth_scopes=data.get("oauth_scopes", []),
+        # OAuth fields (support both mcpl format and Claude Code format)
+        oauth_client_id=data.get("oauth_client_id") or (data.get("oauth", {}) or {}).get("clientId"),
+        oauth_client_secret=data.get("oauth_client_secret") or (data.get("oauth", {}) or {}).get("clientSecret"),
+        oauth_scopes=data.get("oauth_scopes", []) or (data.get("oauth", {}) or {}).get("scopes", []),
+        oauth_callback_port=data.get("oauth_callback_port") or (data.get("oauth", {}) or {}).get("callbackPort"),
         # Static API key (alternative to OAuth)
         api_key=data.get("api_key"),
     )

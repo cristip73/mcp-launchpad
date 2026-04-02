@@ -334,6 +334,7 @@ class OAuthManager:
         www_authenticate: str | None = None,
         scopes: list[str] | None = None,
         callback_timeout: int = 120,
+        callback_port: int = 0,
         on_status: Callable[[str], None] | None = None,
         prompt_for_credentials: Callable[[], tuple[str, str | None]] | None = None,
     ) -> TokenSet:
@@ -348,6 +349,7 @@ class OAuthManager:
             www_authenticate: Optional WWW-Authenticate header from 401
             scopes: Optional scopes to request
             callback_timeout: Timeout for browser callback
+            callback_port: Fixed port for callback server (0 = auto)
             on_status: Callback for status messages
             prompt_for_credentials: Callback for manual credential entry
 
@@ -364,6 +366,7 @@ class OAuthManager:
             client_secret=client_secret,
             www_authenticate=www_authenticate,
             callback_timeout=callback_timeout,
+            callback_port=callback_port,
             on_status=on_status,
         )
 

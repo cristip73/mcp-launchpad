@@ -482,6 +482,7 @@ class OAuthFlow:
         client_secret: str | None = None,
         www_authenticate: str | None = None,
         callback_timeout: int = 120,
+        callback_port: int = 0,
         on_status: Callable[[str], None] | None = None,
     ):
         """Initialize OAuth flow.
@@ -493,6 +494,7 @@ class OAuthFlow:
             client_secret: Optional client secret
             www_authenticate: Optional WWW-Authenticate header from 401
             callback_timeout: Timeout for waiting for callback
+            callback_port: Fixed port for callback server (0 = auto)
             on_status: Optional callback for status messages
         """
         self.server_url = server_url
@@ -501,6 +503,7 @@ class OAuthFlow:
         self.client_secret = client_secret
         self.www_authenticate = www_authenticate
         self.callback_timeout = callback_timeout
+        self.callback_port = callback_port
         self.on_status = on_status or (lambda msg: None)
 
         self._oauth_config: OAuthConfig | None = None
@@ -623,8 +626,13 @@ class OAuthFlow:
             oauth_config = await self.discover()
 
             # Step 2: Start callback server
+            # Use "localhost" hostname when a fixed callback port is configured
+            # (Claude Code/Slack register redirect URIs with "localhost", not "127.0.0.1")
+            callback_host = "localhost" if self.callback_port else "127.0.0.1"
             async with LocalhostCallbackServer(
-                timeout=self.callback_timeout
+                timeout=self.callback_timeout,
+                port=self.callback_port,
+                host=callback_host,
             ) as callback_server:
                 redirect_uri = callback_server.redirect_uri
 
