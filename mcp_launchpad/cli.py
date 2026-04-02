@@ -35,6 +35,33 @@ from .suggestions import (
 logger = logging.getLogger("mcpl")
 
 
+def _parse_flag_args(args: tuple[str, ...]) -> str:
+    """Parse --key value pairs into a JSON string.
+
+    Examples:
+        ("--owner", "acme", "--repo", "api") -> '{"owner": "acme", "repo": "api"}'
+        ("--limit", "5") -> '{"limit": 5}'
+    """
+    result: dict[str, Any] = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--") and i + 1 < len(args):
+            key = arg[2:]  # strip --
+            value: Any = args[i + 1]
+            # Try to parse as boolean; keep everything else as string
+            # (avoids int/float coercion issues with IDs, dates, etc.)
+            if value.lower() == "true":
+                value = True
+            elif value.lower() == "false":
+                value = False
+            result[key] = value
+            i += 2
+        else:
+            i += 1
+    return json.dumps(result)
+
+
 def _check_tool_exists(
     server: str, tool: str, manager: ConnectionManager
 ) -> tuple[bool, list[ToolInfo]]:
@@ -505,10 +532,10 @@ def inspect(ctx: click.Context, server: str, tool: str, example: bool) -> None:
     output.success(result)
 
 
-@main.command()
+@main.command(context_settings={"ignore_unknown_options": True})
 @click.argument("server")
 @click.argument("tool")
-@click.argument("arguments", required=False)
+@click.argument("extra_args", nargs=-1, type=click.UNPROCESSED)
 @click.option("--stdin", is_flag=True, help="Read arguments from stdin")
 @click.option(
     "--no-daemon",
@@ -520,13 +547,20 @@ def call(
     ctx: click.Context,
     server: str,
     tool: str,
-    arguments: str | None,
+    extra_args: tuple[str, ...],
     stdin: bool,
     no_daemon: bool,
 ) -> None:
     """Execute a tool on a server.
 
-    ARGUMENTS should be a JSON object with the tool parameters.
+    ARGUMENTS can be a JSON object or --key value pairs.
+
+    \b
+    Examples:
+      mcpl call github list_issues '{"owner": "acme", "repo": "api"}'
+      mcpl call github list_issues --owner acme --repo api
+      mcpl call server tool                          # no arguments
+
     Use --stdin to read arguments from stdin for large payloads.
 
     By default, uses a persistent session daemon to maintain stateful connections
@@ -536,9 +570,20 @@ def call(
     output: OutputHandler = ctx.obj["output"]
     config = get_config(ctx)
 
-    # Parse arguments
+    # Parse arguments from extra_args (supports both JSON and --key value)
+    arguments: str | None = None
     if stdin:
         arguments = sys.stdin.read()
+    elif extra_args:
+        # Check if it's a single JSON argument
+        if len(extra_args) == 1 and extra_args[0].startswith("{"):
+            arguments = extra_args[0]
+        # Check if it looks like --key value pairs
+        elif extra_args[0].startswith("--"):
+            arguments = _parse_flag_args(extra_args)
+        else:
+            # Try joining as JSON (e.g. split by shell)
+            arguments = " ".join(extra_args)
 
     if not arguments:
         args_dict: dict[str, Any] = {}
@@ -550,8 +595,10 @@ def call(
                 e,
                 error_type="ArgumentParseError",
                 help_text=(
-                    "Arguments must be valid JSON.\n\n"
-                    'Example: mcpl call github list_issues \'{"owner": "acme", "repo": "api"}\''
+                    "Arguments must be valid JSON or --key value pairs.\n\n"
+                    "Examples:\n"
+                    '  mcpl call github list_issues \'{"owner": "acme", "repo": "api"}\'\n'
+                    "  mcpl call github list_issues --owner acme --repo api"
                 ),
             )
             return
