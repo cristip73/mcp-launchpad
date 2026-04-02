@@ -575,7 +575,8 @@ def inspect(ctx: click.Context, server: str, tool: str, example: bool) -> None:
 def _get_max_output_chars(max_chars: int | None) -> int:
     """Resolve the max output chars limit.
 
-    Priority: --max-chars flag > MCPL_MAX_OUTPUT_CHARS env var > default 10000.
+    Priority: --max-chars flag > MCPL_MAX_OUTPUT_CHARS env var > default 40000.
+    Default 40000 chars ≈ 10k tokens, matching Claude Code's MCP warning threshold.
     Returns 0 for unlimited.
     """
     if max_chars is not None:
@@ -586,7 +587,7 @@ def _get_max_output_chars(max_chars: int | None) -> int:
             return int(env_val)
         except ValueError:
             pass
-    return 10000
+    return 40000
 
 
 def _truncate_output(
@@ -650,7 +651,7 @@ def _truncate_output(
     "--max-chars",
     type=int,
     default=None,
-    help="Max output chars (0=unlimited, default: 10000 or MCPL_MAX_OUTPUT_CHARS env var)",
+    help="Max output chars (0=unlimited, default: 40000 or MCPL_MAX_OUTPUT_CHARS env var)",
 )
 @click.pass_context
 def call(
