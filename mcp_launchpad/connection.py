@@ -199,6 +199,11 @@ class ConnectionManager:
                 logger.debug(f"Using static API key for '{server_name}'")
             else:
                 oauth_manager = get_oauth_manager()
+                # Proactively refresh expired tokens before connecting
+                if not oauth_manager.has_valid_token(url):
+                    refreshed = await oauth_manager.refresh_if_needed(url)
+                    if refreshed:
+                        logger.info(f"Proactively refreshed expired token for '{server_name}'")
                 auth_header = oauth_manager.get_auth_header(url)
                 if auth_header:
                     headers["Authorization"] = auth_header
@@ -245,8 +250,43 @@ class ConnectionManager:
                         },
                     )
                     if preflight_response.status_code == 401:
-                        www_auth = preflight_response.headers.get("WWW-Authenticate")
-                        raise OAuthRequiredError(server_name, url, www_auth)
+                        # Attempt token refresh before giving up
+                        oauth_mgr = get_oauth_manager()
+                        refreshed = await oauth_mgr.refresh_if_needed(url)
+                        if refreshed:
+                            new_header = oauth_mgr.get_auth_header(url)
+                            if new_header:
+                                headers["Authorization"] = new_header
+                                # Recreate httpx client with refreshed token
+                                await http_client.aclose()
+                                http_client = httpx.AsyncClient(
+                                    headers=headers,
+                                    timeout=httpx.Timeout(CONNECTION_TIMEOUT, connect=30.0),
+                                )
+                                logger.info(f"Refreshed OAuth token for '{server_name}', retrying")
+                                # Re-do preflight with new token
+                                preflight_response = await http_client.post(
+                                    url,
+                                    json={
+                                        "jsonrpc": "2.0",
+                                        "method": "initialize",
+                                        "id": 0,
+                                        "params": {
+                                            "protocolVersion": "2024-11-05",
+                                            "capabilities": {},
+                                            "clientInfo": {"name": "mcpl", "version": "0.1.0"},
+                                        },
+                                    },
+                                )
+                                if preflight_response.status_code == 401:
+                                    www_auth = preflight_response.headers.get("WWW-Authenticate")
+                                    raise OAuthRequiredError(server_name, url, www_auth)
+                            else:
+                                www_auth = preflight_response.headers.get("WWW-Authenticate")
+                                raise OAuthRequiredError(server_name, url, www_auth)
+                        else:
+                            www_auth = preflight_response.headers.get("WWW-Authenticate")
+                            raise OAuthRequiredError(server_name, url, www_auth)
                 except httpx.RequestError:
                     # If preflight fails for network reasons, proceed and let
                     # streamable_http_client handle the error
