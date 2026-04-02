@@ -121,8 +121,12 @@ class Daemon:
         await self._ipc_server.start()
         logger.info("IPC server started")
 
-        # Pre-connect to all configured servers
-        await self._connect_all_servers()
+        # Servers connect lazily on first use (no eager pre-connection).
+        # This avoids spawning processes for MCPs that may never be called.
+        logger.info(
+            f"Lazy connect mode: {len(self.state.config.servers)} servers configured, "
+            "connections will be established on first use"
+        )
 
         # Start parent monitoring task
         parent_monitor = asyncio.create_task(self._monitor_parent())
@@ -779,11 +783,21 @@ class Daemon:
     def _get_status(self) -> dict[str, Any]:
         """Get daemon status information."""
         servers = {}
-        for name, state in self.state.servers.items():
-            servers[name] = {
-                "connected": state.connected,
-                "error": state.error,
-            }
+        # Include all configured servers (showing lazy status for unconnected ones)
+        all_names = set(self.state.config.servers.keys()) | set(self.state.servers.keys())
+        for name in all_names:
+            state = self.state.servers.get(name)
+            if state:
+                servers[name] = {
+                    "connected": state.connected,
+                    "error": state.error,
+                }
+            else:
+                servers[name] = {
+                    "connected": False,
+                    "error": None,
+                    "lazy": True,  # Not yet connected (lazy mode)
+                }
 
         return {
             "success": True,
