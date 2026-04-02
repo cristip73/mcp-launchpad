@@ -823,9 +823,10 @@ class Daemon:
                 "error_type": "tool_not_found",
             }
 
-        # Call the tool
+        # Call the tool (update last_used after to prevent idle disconnect during long calls)
         try:
             result = await server_state.session.call_tool(tool_name, arguments)
+            server_state.last_used = time.time()
         except Exception as e:
             # Handle MCP protocol errors (JSON-RPC errors)
             error_str = str(e)
