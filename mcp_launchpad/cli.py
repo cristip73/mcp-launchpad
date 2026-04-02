@@ -789,6 +789,11 @@ def call(
             # Result is already extracted by the daemon (and errors enriched)
             result_data = result.get("result", result)
 
+            # Hint for common type mismatch (nested object passed as string via flags)
+            result_str = str(result_data)
+            if "Expected Object but got String" in result_str or "Expected Array but got String" in result_str:
+                result_data = result_str + "\n\nHint: use full JSON syntax for nested params: mcpl call " + server + " " + tool + " '{\"param\": {\"nested\": \"val\"}}'"
+
             # Apply output truncation
             char_limit = _get_max_output_chars(max_chars)
             result_data = _truncate_output(
