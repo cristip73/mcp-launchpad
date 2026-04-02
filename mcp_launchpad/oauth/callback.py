@@ -218,14 +218,14 @@ class LocalhostCallbackServer:
             result = await server.wait_for_callback()
     """
 
-    def __init__(self, timeout: int = DEFAULT_TIMEOUT, path: str = "/callback", port: int = 0, host: str = "127.0.0.1"):
+    def __init__(self, timeout: int = DEFAULT_TIMEOUT, path: str = "/callback", port: int = 0, host: str = "localhost"):
         """Initialize callback server.
 
         Args:
             timeout: Timeout in seconds to wait for callback
             path: URL path to listen on (default "/callback")
             port: Fixed port to use (0 = let OS assign)
-            host: Host to bind to and use in redirect URI
+            host: Hostname for redirect URI (default "localhost" per MCP OAuth spec)
         """
         self.timeout = timeout
         self.path = path

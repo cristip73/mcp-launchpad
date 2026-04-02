@@ -626,13 +626,9 @@ class OAuthFlow:
             oauth_config = await self.discover()
 
             # Step 2: Start callback server
-            # Use "localhost" hostname when a fixed callback port is configured
-            # (Claude Code/Slack register redirect URIs with "localhost", not "127.0.0.1")
-            callback_host = "localhost" if self.callback_port else "127.0.0.1"
             async with LocalhostCallbackServer(
                 timeout=self.callback_timeout,
                 port=self.callback_port,
-                host=callback_host,
             ) as callback_server:
                 redirect_uri = callback_server.redirect_uri
 
