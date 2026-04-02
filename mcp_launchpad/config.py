@@ -123,8 +123,9 @@ CONFIG_SEARCH_DIRS = [
     Path.home() / ".config" / "claude",  # XDG standard (Linux)
 ]
 
-# File to exclude (Claude Code's convention - avoids collision)
-EXCLUDED_CONFIG_FILES = {".mcp.json"}
+# Previously excluded .mcp.json (Claude Code's convention) to avoid collision,
+# but now we include it so mcpl can serve as a shared daemon for Claude Code's MCPs.
+EXCLUDED_CONFIG_FILES: set[str] = set()
 
 
 
@@ -172,7 +173,7 @@ def find_config_files(
     """Find MCP config files with 'mcp' in the filename.
 
     Searches for JSON files containing 'mcp' in the filename (case-insensitive),
-    excluding '.mcp.json' (Claude Code's convention) to avoid collision.
+    including '.mcp.json' (Claude Code's convention) for shared daemon use.
 
     When multiple config files exist, this function respects user preferences
     for which configs to use (unless respect_preferences=False).
@@ -306,8 +307,8 @@ def load_config(
 ) -> Config:
     """Load MCP configuration from discovered or explicit paths.
 
-    Finds all JSON files with 'mcp' in the filename (excluding '.mcp.json'
-    which is reserved for Claude Code) and aggregates servers from all of them.
+    Finds all JSON files with 'mcp' in the filename (including '.mcp.json'
+    from Claude Code) and aggregates servers from all of them.
 
     When multiple config files exist, respects user preferences for which
     configs to use (unless explicit config_path is provided or
@@ -343,7 +344,6 @@ def load_config(
             f"No MCP config file found.\n\n"
             f"Searched directories for *mcp*.json files:\n"
             f"  {searched}\n\n"
-            f"Note: '.mcp.json' is excluded (reserved for Claude Code).\n\n"
             f"Create a config file with your MCP servers. Example (mcp.json):\n\n"
             f'{{\n  "mcpServers": {{\n'
             f'    "github": {{\n'

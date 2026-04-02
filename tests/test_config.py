@@ -357,45 +357,40 @@ class TestFindConfigFiles:
         for f in files:
             assert f.resolve() in resolved_results
 
-    def test_excludes_dot_mcp_json(self, tmp_path: Path, monkeypatch):
-        """Test that .mcp.json (Claude Code's convention) is excluded."""
+    def test_includes_dot_mcp_json(self, tmp_path: Path, monkeypatch):
+        """Test that .mcp.json (Claude Code's convention) is now included."""
         monkeypatch.chdir(tmp_path)
         # Create both .mcp.json and mcp.json
-        excluded_file = tmp_path / ".mcp.json"
-        included_file = tmp_path / "mcp.json"
-        excluded_file.write_text("{}")
-        included_file.write_text("{}")
+        dot_mcp_file = tmp_path / ".mcp.json"
+        mcp_file = tmp_path / "mcp.json"
+        dot_mcp_file.write_text("{}")
+        mcp_file.write_text("{}")
 
         result = find_config_files(None, respect_preferences=False)
         resolved_results = [f.resolve() for f in result]
 
-        # .mcp.json should be excluded
-        assert excluded_file.resolve() not in resolved_results
-        # mcp.json should be included
-        assert included_file.resolve() in resolved_results
+        # Both should be included
+        assert dot_mcp_file.resolve() in resolved_results
+        assert mcp_file.resolve() in resolved_results
 
-    def test_excludes_only_exact_dot_mcp_json(self, tmp_path: Path, monkeypatch):
-        """Test that only exactly '.mcp.json' is excluded, not similar names."""
+    def test_includes_all_mcp_json_variants(self, tmp_path: Path, monkeypatch):
+        """Test that all mcp JSON variants are included."""
         monkeypatch.chdir(tmp_path)
         # These should all be included
-        similar_files = [
+        all_files = [
             tmp_path / "my.mcp.json",
             tmp_path / ".mcp-servers.json",
             tmp_path / "dot-mcp.json",
+            tmp_path / ".mcp.json",
         ]
-        for f in similar_files:
+        for f in all_files:
             f.write_text("{}")
-
-        # This should be excluded
-        excluded_file = tmp_path / ".mcp.json"
-        excluded_file.write_text("{}")
 
         result = find_config_files(None, respect_preferences=False)
         resolved_results = [f.resolve() for f in result]
 
-        for f in similar_files:
+        for f in all_files:
             assert f.resolve() in resolved_results
-        assert excluded_file.resolve() not in resolved_results
 
     def test_searches_claude_directory(self, tmp_path: Path, monkeypatch):
         """Test that .claude directory is searched."""
@@ -800,8 +795,8 @@ class TestLoadConfig:
         assert config.env_path == custom_env
         assert os.environ.get("CUSTOM_VAR") == "custom_value"
 
-    def test_ignores_dot_mcp_json(self, tmp_path: Path, monkeypatch):
-        """Test that .mcp.json (Claude Code's convention) is ignored."""
+    def test_includes_dot_mcp_json(self, tmp_path: Path, monkeypatch):
+        """Test that .mcp.json (Claude Code's convention) is now included."""
         monkeypatch.chdir(tmp_path)
         # Isolate test from user's real config files
         import mcp_launchpad.config as config_module
@@ -809,21 +804,22 @@ class TestLoadConfig:
         monkeypatch.setattr(config_module, "CONFIG_SEARCH_DIRS", [Path(".")])
 
         # Create .mcp.json with a server
-        excluded_data = {"mcpServers": {"excluded": {"command": "excluded"}}}
-        excluded_file = tmp_path / ".mcp.json"
-        excluded_file.write_text(json.dumps(excluded_data))
+        dot_mcp_data = {"mcpServers": {"from_dot_mcp": {"command": "dot_mcp_cmd"}}}
+        dot_mcp_file = tmp_path / ".mcp.json"
+        dot_mcp_file.write_text(json.dumps(dot_mcp_data))
 
         # Create mcp.json with a different server
-        included_data = {"mcpServers": {"included": {"command": "included"}}}
-        included_file = tmp_path / "mcp.json"
-        included_file.write_text(json.dumps(included_data))
+        mcp_data = {"mcpServers": {"from_mcp": {"command": "mcp_cmd"}}}
+        mcp_file = tmp_path / "mcp.json"
+        mcp_file.write_text(json.dumps(mcp_data))
 
         config = load_config(respect_preferences=False)
 
-        # Only the server from mcp.json should be loaded
-        assert "included" in config.servers
-        assert "excluded" not in config.servers
-        assert config.servers["included"].command == "included"
+        # Both servers should be loaded
+        assert "from_mcp" in config.servers
+        assert "from_dot_mcp" in config.servers
+        assert config.servers["from_mcp"].command == "mcp_cmd"
+        assert config.servers["from_dot_mcp"].command == "dot_mcp_cmd"
 
     def test_aggregates_multiple_config_files(self, tmp_path: Path, monkeypatch):
         """Test loading and aggregating servers from multiple config files."""
