@@ -58,6 +58,14 @@ def _get_backoff_delay(attempt: int, base_delay: int = RECONNECT_DELAY) -> int:
     delay = base_delay * (2 ** (attempt - 1))
     return int(min(delay, 60))  # Cap at 60 seconds
 
+# Per-server idle timeout (seconds) - 0 to disable
+# If a server hasn't received a call in this time, it will be disconnected.
+# It reconnects lazily on next use.
+SERVER_IDLE_TIMEOUT = int(os.environ.get("MCPL_SERVER_IDLE_TIMEOUT", "600"))  # 10 min default
+
+# How often to check for idle servers (seconds)
+SERVER_IDLE_CHECK_INTERVAL = 30
+
 # Idle timeout for daemon shutdown (seconds) - 0 to disable
 # In IDE environments, daemon shuts down after this period of inactivity
 IDLE_TIMEOUT = int(os.environ.get("MCPL_IDLE_TIMEOUT", "3600"))  # 1 hour default
@@ -78,6 +86,7 @@ class ServerState:
     http_client: httpx.AsyncClient | None = None  # For HTTP servers
     connected: bool = False
     error: str | None = None
+    last_used: float = field(default_factory=time.time)  # For per-server idle timeout
 
 
 @dataclass
@@ -131,12 +140,20 @@ class Daemon:
         # Start parent monitoring task
         parent_monitor = asyncio.create_task(self._monitor_parent())
 
+        # Start per-server idle timeout checker
+        idle_checker = None
+        if SERVER_IDLE_TIMEOUT > 0:
+            idle_checker = asyncio.create_task(self._check_idle_servers())
+            logger.info(f"Per-server idle timeout: {SERVER_IDLE_TIMEOUT}s")
+
         try:
             # Run until shutdown
             while self.state.running:
                 await asyncio.sleep(1)
         finally:
             parent_monitor.cancel()
+            if idle_checker:
+                idle_checker.cancel()
             await self._shutdown()
 
     def _setup_signal_handlers(self) -> None:
@@ -162,6 +179,52 @@ class Daemon:
         for server_name in self.state.config.servers:
             task = asyncio.create_task(self._connect_server(server_name))
             self._connection_tasks[server_name] = task
+
+    async def _check_idle_servers(self) -> None:
+        """Periodically check for idle servers and disconnect them."""
+        while self.state.running:
+            await asyncio.sleep(SERVER_IDLE_CHECK_INTERVAL)
+            now = time.time()
+            for name, state in list(self.state.servers.items()):
+                if not state.connected:
+                    continue
+                idle_time = now - state.last_used
+                if idle_time > SERVER_IDLE_TIMEOUT:
+                    logger.info(
+                        f"Server '{name}' idle for {idle_time:.0f}s "
+                        f"(> {SERVER_IDLE_TIMEOUT}s), disconnecting"
+                    )
+                    await self._disconnect_server(name)
+
+    async def _disconnect_server(self, server_name: str) -> None:
+        """Disconnect a single server, allowing lazy reconnection later."""
+        # Cancel connection task if running
+        task = self._connection_tasks.get(server_name)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            del self._connection_tasks[server_name]
+
+        # Clean up server state
+        state = self.state.servers.get(server_name)
+        if state:
+            if state.stderr_file:
+                try:
+                    state.stderr_file.close()
+                    Path(state.stderr_file.name).unlink(missing_ok=True)
+                except Exception as e:
+                    logger.debug(f"Failed to cleanup stderr file for {server_name}: {e}")
+            if state.http_client:
+                try:
+                    await state.http_client.aclose()
+                except Exception as e:
+                    logger.debug(f"Failed to cleanup HTTP client for {server_name}: {e}")
+            # Remove state so _ensure_server_connected will re-create it on next use
+            del self.state.servers[server_name]
+            logger.info(f"Server '{server_name}' disconnected (idle timeout)")
 
     async def _connect_server(self, server_name: str) -> None:
         """Connect to a single MCP server and maintain the connection with auto-restart."""
@@ -617,6 +680,7 @@ class Daemon:
         while asyncio.get_event_loop().time() - start_time < CONNECTION_TIMEOUT:
             server_state = self.state.servers.get(server_name)
             if server_state and server_state.connected and server_state.session:
+                server_state.last_used = time.time()
                 return server_state
             if server_state and server_state.error:
                 error_msg = (
