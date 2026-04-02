@@ -572,6 +572,70 @@ def inspect(ctx: click.Context, server: str, tool: str, example: bool) -> None:
     output.success(result)
 
 
+def _get_max_output_chars(max_chars: int | None) -> int:
+    """Resolve the max output chars limit.
+
+    Priority: --max-chars flag > MCPL_MAX_OUTPUT_CHARS env var > default 10000.
+    Returns 0 for unlimited.
+    """
+    if max_chars is not None:
+        return max_chars
+    env_val = os.environ.get("MCPL_MAX_OUTPUT_CHARS")
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+    return 10000
+
+
+def _truncate_output(
+    result_data: Any,
+    max_chars: int,
+    server: str,
+    tool: str,
+) -> Any:
+    """Truncate result_data if it exceeds max_chars.
+
+    Measures the rendered length of result_data. If over limit, saves the full
+    output to /tmp/mcpl/ and returns a truncated version with a pointer to the
+    full file.
+
+    For string results: truncates the string directly.
+    For structured results (dict/list): serializes to JSON, then truncates.
+
+    Returns the original result_data unchanged if within limit.
+    """
+    if max_chars <= 0:
+        return result_data
+
+    # Get the text representation to measure and truncate
+    if isinstance(result_data, str):
+        text = result_data
+    else:
+        text = json.dumps(result_data, indent=2, default=str)
+
+    if len(text) <= max_chars:
+        return result_data
+
+    # Save full output to temp file
+    tmp_dir = Path("/tmp/mcpl")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tmp_file = tmp_dir / f"mcpl_{server}_{tool}_{timestamp}.txt"
+    tmp_file.write_text(text, encoding="utf-8")
+
+    truncation_notice = (
+        f"\n\n... (truncated at {max_chars} chars, full output: {tmp_file})"
+    )
+
+    # Return truncated string — this preserves type consistency:
+    # string input → truncated string, structured input → stringified truncated
+    return text[:max_chars] + truncation_notice
+
+
 @main.command(context_settings={"ignore_unknown_options": True})
 @click.argument("server")
 @click.argument("tool")
@@ -582,6 +646,12 @@ def inspect(ctx: click.Context, server: str, tool: str, example: bool) -> None:
     is_flag=True,
     help="Bypass daemon and connect directly (slower but more reliable)",
 )
+@click.option(
+    "--max-chars",
+    type=int,
+    default=None,
+    help="Max output chars (0=unlimited, default: 10000 or MCPL_MAX_OUTPUT_CHARS env var)",
+)
 @click.pass_context
 def call(
     ctx: click.Context,
@@ -590,6 +660,7 @@ def call(
     extra_args: tuple[str, ...],
     stdin: bool,
     no_daemon: bool,
+    max_chars: int | None,
 ) -> None:
     """Execute a tool on a server.
 
@@ -615,10 +686,10 @@ def call(
     if stdin:
         arguments = sys.stdin.read()
     elif extra_args:
-        has_json = any(a.startswith("{") for a in extra_args)
+        first_is_json = extra_args[0].startswith("{")
         has_flags = any(a.startswith("--") for a in extra_args)
 
-        if has_json and has_flags:
+        if first_is_json and has_flags:
             output.error(
                 ValueError("Cannot mix JSON and --key value syntax"),
                 error_type="ArgumentParseError",
@@ -629,7 +700,7 @@ def call(
                 ),
             )
             return
-        elif has_json and len(extra_args) == 1:
+        elif first_is_json and len(extra_args) == 1:
             arguments = extra_args[0]
         elif has_flags:
             arguments = _parse_flag_args(extra_args)
@@ -703,6 +774,12 @@ def call(
                 output.success({"result": result_data, "error": True})
                 return
 
+            # Apply output truncation
+            char_limit = _get_max_output_chars(max_chars)
+            result_data = _truncate_output(
+                result_data, char_limit, server, tool
+            )
+
             output.success({"result": result_data})
         else:
             # Call the tool via session daemon (maintains persistent connections)
@@ -711,6 +788,12 @@ def call(
             result = asyncio.run(session.call_tool(server, tool, args_dict))
             # Result is already extracted by the daemon (and errors enriched)
             result_data = result.get("result", result)
+
+            # Apply output truncation
+            char_limit = _get_max_output_chars(max_chars)
+            result_data = _truncate_output(
+                result_data, char_limit, server, tool
+            )
 
             output.success({"result": result_data})
     except Exception as e:
