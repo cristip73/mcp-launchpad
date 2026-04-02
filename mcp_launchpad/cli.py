@@ -36,38 +36,70 @@ logger = logging.getLogger("mcpl")
 
 
 def _parse_flag_args(args: tuple[str, ...]) -> str:
-    """Parse --key value pairs into a JSON string.
+    """Parse --key value or --key=value pairs into a JSON string.
 
     Examples:
         ("--owner", "acme", "--repo", "api") -> '{"owner": "acme", "repo": "api"}'
-        ("--limit", "5") -> '{"limit": 5}'
+        ("--owner=acme", "--repo=api")       -> '{"owner": "acme", "repo": "api"}'
+        ("--limit", "5")                     -> '{"limit": 5}'
     """
     result: dict[str, Any] = {}
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg.startswith("--") and i + 1 < len(args):
-            key = arg[2:]  # strip --
-            value: Any = args[i + 1]
-            # Try to parse as boolean or short number; keep long numbers as
-            # strings (likely IDs, account numbers, dates, etc.)
-            if value.lower() == "true":
-                value = True
-            elif value.lower() == "false":
-                value = False
-            elif len(value) <= 4:
-                try:
-                    value = int(value)
-                except ValueError:
-                    try:
-                        value = float(value)
-                    except ValueError:
-                        pass
-            result[key] = value
+        if not arg.startswith("--"):
+            i += 1
+            continue
+
+        # Handle --key=value (equals syntax, common in GNU tools and LLM output)
+        if "=" in arg:
+            key, raw_value = arg[2:].split("=", 1)
+            result[key] = _coerce_value(raw_value)
+            i += 1
+        # Handle --key value (space-separated)
+        elif i + 1 < len(args):
+            key = arg[2:]
+            result[key] = _coerce_value(args[i + 1])
             i += 2
         else:
-            i += 1
+            # --flag at end with no value
+            raise click.UsageError(f"Flag '{arg}' at end of arguments has no value")
     return json.dumps(result)
+
+
+def _coerce_value(raw: str) -> Any:
+    """Coerce a string value to the most likely type.
+
+    - "true"/"false" -> bool
+    - Pure numeric without date separators -> int/float
+    - Strings with leading zeros (e.g. "007") -> keep as string (likely ID)
+    - Strings with dashes (e.g. "2026-04-01") -> keep as string (likely date)
+    """
+    if raw.lower() == "true":
+        return True
+    if raw.lower() == "false":
+        return False
+    # Keep as string if it looks like a date or has leading zeros
+    if "-" in raw and not raw.startswith("-"):
+        return raw  # likely a date like 2026-04-01
+    if len(raw) > 1 and raw.startswith("0") and not raw.startswith("0."):
+        return raw  # leading zero like "007" — keep as string
+    # Try int coercion, but keep very long numbers as strings (likely IDs)
+    try:
+        n = int(raw)
+        if len(raw) > 6:
+            return raw  # >6 digits = likely an ID, account number, etc.
+        return n
+    except ValueError:
+        pass
+    try:
+        f = float(raw)
+        if len(raw) > 6:
+            return raw
+        return f
+    except ValueError:
+        pass
+    return raw
 
 
 def _check_tool_exists(
