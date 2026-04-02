@@ -84,9 +84,12 @@ Environment variables use `${VAR}` syntax and are loaded from `~/.claude/.env` a
 ### Config Discovery
 
 MCP Launchpad searches for config files in this order:
-1. `./mcp.json` - Project-level config
-2. `./.claude/mcp.json` - Project-level Claude config
-3. `~/.claude/mcp.json` - User-level config
+1. `./.mcp.json` - Claude Code's config (project-level)
+2. `./mcp.json` - Project-level config
+3. `./.claude/mcp.json` - Project-level Claude config
+4. `~/.claude/mcp.json` - User-level config
+
+This includes `.mcp.json` (Claude Code's convention), so mcpl can serve as a shared daemon for all MCPs configured in Claude Code.
 
 When multiple config files are found, mcpl prompts you to select which ones to use. Your preferences are saved and can be changed later with `mcpl config files --select`.
 
@@ -234,6 +237,19 @@ mcpl --json call github list_repos '{}'
 ## Session Daemon
 
 MCP Launchpad uses a session daemon to maintain persistent connections to MCP servers, improving performance for repeated calls. The daemon starts automatically on first `mcpl call`.
+
+### Lazy Connect
+
+Servers are **not** pre-connected at daemon startup. Instead, each server connects lazily on its first `mcpl call` or `mcpl list <server>` request. This avoids spawning processes for MCPs that may never be used in a session.
+
+### Per-Server Idle Timeout
+
+Connected servers that haven't received a request in `MCPL_SERVER_IDLE_TIMEOUT` seconds (default: 600s / 10 minutes) are automatically disconnected. They reconnect lazily on next use. Set to `0` to disable.
+
+```bash
+export MCPL_SERVER_IDLE_TIMEOUT=300   # Disconnect after 5 minutes idle
+export MCPL_SERVER_IDLE_TIMEOUT=0     # Never disconnect idle servers
+```
 
 ### Automatic Cleanup
 
@@ -428,6 +444,7 @@ Common settings you may need to configure:
 | `MCPL_CONFIG_FILES` | (auto) | Comma-separated list of config files (overrides discovery) |
 | `MCPL_CONNECTION_TIMEOUT` | `45` | Server connection timeout in seconds |
 | `MCPL_IDLE_TIMEOUT` | `3600` | Daemon idle timeout (0 to disable) |
+| `MCPL_SERVER_IDLE_TIMEOUT` | `600` | Per-server idle disconnect timeout (0 to disable) |
 
 <details>
 <summary><strong>All Environment Variables</strong></summary>
@@ -453,6 +470,7 @@ Common settings you may need to configure:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCPL_IDLE_TIMEOUT` | `3600` | Shut down daemon after this many seconds of inactivity (0 to disable) |
+| `MCPL_SERVER_IDLE_TIMEOUT` | `600` | Disconnect individual servers after this many seconds idle (0 to disable) |
 | `MCPL_IDE_ANCHOR_CHECK_INTERVAL` | `10` | How often to check if IDE session is still active (seconds) |
 | `MCPL_SESSION_ID` | (auto) | Override the session ID (for testing or advanced multi-session setups) |
 
