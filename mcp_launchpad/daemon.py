@@ -48,6 +48,10 @@ RECONNECT_DELAY = int(os.environ.get("MCPL_RECONNECT_DELAY", "5"))
 # Maximum reconnection attempts before giving up
 MAX_RECONNECT_ATTEMPTS = int(os.environ.get("MCPL_MAX_RECONNECT_ATTEMPTS", "3"))
 
+# How often to proactively refresh OAuth tokens (seconds)
+# Runs in background to prevent tokens from expiring mid-session
+OAUTH_REFRESH_INTERVAL = int(os.environ.get("MCPL_OAUTH_REFRESH_INTERVAL", "1200"))  # 20 min
+
 
 def _get_backoff_delay(attempt: int, base_delay: int = RECONNECT_DELAY) -> int:
     """Calculate exponential backoff delay for reconnection attempts.
@@ -146,6 +150,12 @@ class Daemon:
             idle_checker = asyncio.create_task(self._check_idle_servers())
             logger.info(f"Per-server idle timeout: {SERVER_IDLE_TIMEOUT}s")
 
+        # Start proactive OAuth token refresh
+        oauth_refresher = None
+        if OAUTH_REFRESH_INTERVAL > 0:
+            oauth_refresher = asyncio.create_task(self._refresh_oauth_tokens())
+            logger.info(f"OAuth token refresh interval: {OAUTH_REFRESH_INTERVAL}s")
+
         try:
             # Run until shutdown
             while self.state.running:
@@ -154,6 +164,8 @@ class Daemon:
             parent_monitor.cancel()
             if idle_checker:
                 idle_checker.cancel()
+            if oauth_refresher:
+                oauth_refresher.cancel()
             await self._shutdown()
 
     def _setup_signal_handlers(self) -> None:
@@ -179,6 +191,39 @@ class Daemon:
         for server_name in self.state.config.servers:
             task = asyncio.create_task(self._connect_server(server_name))
             self._connection_tasks[server_name] = task
+
+    async def _refresh_oauth_tokens(self) -> None:
+        """Periodically refresh OAuth tokens before they expire."""
+        from datetime import datetime, timedelta, timezone
+
+        while self.state.running:
+            await asyncio.sleep(OAUTH_REFRESH_INTERVAL)
+            oauth_manager = get_oauth_manager()
+            for server_url in oauth_manager.list_authenticated_servers():
+                try:
+                    token = oauth_manager.get_token(server_url)
+                    if token is None or not token.has_refresh_token():
+                        continue
+                    # Refresh if expired or expiring within 10 minutes
+                    needs_refresh = token.is_expired()
+                    if not needs_refresh and token.expires_at:
+                        now = datetime.now(timezone.utc)
+                        expires_at = token.expires_at
+                        if expires_at.tzinfo is None:
+                            expires_at = expires_at.replace(tzinfo=timezone.utc)
+                        needs_refresh = (expires_at - now) < timedelta(minutes=10)
+                    if needs_refresh:
+                        refreshed = await oauth_manager.refresh_proactively(server_url)
+                        if refreshed:
+                            logger.info(
+                                f"Proactively refreshed OAuth token for {server_url}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Failed to refresh OAuth token for {server_url}"
+                            )
+                except Exception as e:
+                    logger.debug(f"Error checking token for {server_url}: {e}")
 
     async def _check_idle_servers(self) -> None:
         """Periodically check for idle servers and disconnect them."""

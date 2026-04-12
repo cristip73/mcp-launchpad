@@ -456,6 +456,57 @@ class OAuthManager:
             logger.warning(f"Token refresh failed for {server_url}: {e}")
             return False
 
+    async def refresh_proactively(self, server_url: str) -> bool:
+        """Refresh the token proactively, even if not yet expired.
+
+        Used by the daemon's periodic refresh task to renew tokens
+        before they expire, preventing mid-session auth failures.
+
+        Args:
+            server_url: The MCP server URL
+
+        Returns:
+            True if token was refreshed, False if refresh failed
+        """
+        token = self._store.get_token(server_url)
+        if token is None:
+            return False
+        if not token.has_refresh_token():
+            return False
+
+        oauth_config = self._oauth_configs.get(server_url)
+        if oauth_config is None:
+            try:
+                oauth_config = await discover_oauth_config(server_url)
+                self._oauth_configs[server_url] = oauth_config
+            except (DiscoveryError, Exception) as e:
+                logger.warning(f"OAuth discovery failed for proactive refresh: {e}")
+                return False
+
+        auth_server = oauth_config.auth_server_metadata.issuer
+        client = self._store.get_client(auth_server)
+        if client is None:
+            logger.warning(f"No client credentials for {auth_server}")
+            return False
+
+        try:
+            token_response = await refresh_token(
+                oauth_config.auth_server_metadata,
+                client,
+                token.refresh_token,  # type: ignore
+                oauth_config.resource_uri,
+            )
+            new_token = TokenSet.from_token_response(
+                token_response,
+                oauth_config.resource_uri,
+            )
+            self._store.set_token(server_url, new_token)
+            logger.info(f"Token proactively refreshed for {server_url}")
+            return True
+        except TokenExchangeError as e:
+            logger.warning(f"Proactive token refresh failed for {server_url}: {e}")
+            return False
+
     def logout(self, server_url: str) -> bool:
         """Remove stored authentication for a server (sync version).
 
