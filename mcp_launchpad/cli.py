@@ -1373,6 +1373,205 @@ def auth_login(
         )
 
 
+@auth.command("refresh")
+@click.argument("server")
+@click.pass_context
+def auth_refresh(ctx: click.Context, server: str) -> None:
+    """Manually refresh the OAuth token for a server.
+
+    Useful for debugging token refresh issues. Shows whether the refresh
+    succeeded and the new token details.
+
+    Example:
+        mcpl auth refresh happyscribe
+    """
+    output: OutputHandler = ctx.obj["output"]
+    config = get_config(ctx)
+
+    if server not in config.servers:
+        available = ", ".join(sorted(config.servers.keys()))
+        output.error(
+            ValueError(f"Server '{server}' not found"),
+            help_text=f"Available servers: {available}",
+        )
+        return
+
+    server_config = config.servers[server]
+    if not server_config.is_http():
+        output.error(
+            ValueError(f"Server '{server}' is a stdio server"),
+            help_text="OAuth refresh is only for HTTP servers.",
+        )
+        return
+
+    url = server_config.get_resolved_url()
+    oauth_manager = get_oauth_manager()
+
+    token = oauth_manager.get_token(url)
+    if token is None:
+        output.error(
+            ValueError(f"No token stored for '{server}'"),
+            help_text=f"Authenticate first: mcpl auth login {server}",
+        )
+        return
+
+    if not token.has_refresh_token():
+        if ctx.obj["json_mode"]:
+            output.success({
+                "server": server,
+                "status": "no_refresh_token",
+                "has_refresh_token": False,
+                "expired": token.is_expired(),
+            })
+        else:
+            click.secho(f"Token for '{server}' has no refresh_token.", fg="yellow")
+            click.echo("Cannot refresh — re-authenticate instead:")
+            click.secho(f"  mcpl auth login {server} --force", fg="cyan")
+        return
+
+    # Attempt refresh
+    if not ctx.obj["json_mode"]:
+        click.echo(f"Refreshing token for '{server}'...")
+
+    try:
+        refreshed = asyncio.run(oauth_manager.refresh_proactively(url))
+    except Exception as e:
+        output.error(e, help_text=f"Try re-authenticating: mcpl auth login {server} --force")
+        return
+
+    if refreshed:
+        new_token = oauth_manager.get_token(url)
+        if ctx.obj["json_mode"]:
+            output.success({
+                "server": server,
+                "status": "refreshed",
+                "expires_at": new_token.expires_at.isoformat() if new_token and new_token.expires_at else None,
+                "has_refresh_token": new_token.has_refresh_token() if new_token else False,
+                "scope": new_token.scope if new_token else None,
+            })
+        else:
+            click.secho("Token refreshed successfully!", fg="green")
+            if new_token:
+                if new_token.expires_at:
+                    click.echo(f"  Expires at: {new_token.expires_at.isoformat()}")
+                click.echo(f"  Has refresh_token: {new_token.has_refresh_token()}")
+                if new_token.scope:
+                    click.echo(f"  Scopes: {new_token.scope}")
+    else:
+        if ctx.obj["json_mode"]:
+            output.success({"server": server, "status": "refresh_failed"})
+        else:
+            click.secho("Token refresh failed.", fg="red")
+            click.echo("Try re-authenticating:")
+            click.secho(f"  mcpl auth login {server} --force", fg="cyan")
+
+
+@auth.command("discover")
+@click.argument("server")
+@click.pass_context
+def auth_discover(ctx: click.Context, server: str) -> None:
+    """Show OAuth discovery metadata for a server.
+
+    Displays the OAuth configuration discovered from the server,
+    including supported scopes, endpoints, and capabilities.
+    Useful for debugging authentication issues.
+
+    Example:
+        mcpl auth discover grain
+    """
+    from .oauth import DiscoveryError, discover_oauth_config
+
+    output: OutputHandler = ctx.obj["output"]
+    config = get_config(ctx)
+
+    if server not in config.servers:
+        available = ", ".join(sorted(config.servers.keys()))
+        output.error(
+            ValueError(f"Server '{server}' not found"),
+            help_text=f"Available servers: {available}",
+        )
+        return
+
+    server_config = config.servers[server]
+    if not server_config.is_http():
+        output.error(
+            ValueError(f"Server '{server}' is a stdio server"),
+            help_text="OAuth discovery is only for HTTP servers.",
+        )
+        return
+
+    url = server_config.get_resolved_url()
+
+    if not ctx.obj["json_mode"]:
+        click.echo(f"Discovering OAuth configuration for '{server}' ({url})...")
+        click.echo()
+
+    try:
+        oauth_config = asyncio.run(discover_oauth_config(url))
+    except DiscoveryError as e:
+        output.error(e, help_text="The server may not support OAuth discovery.")
+        return
+    except Exception as e:
+        output.error(e, help_text="Unexpected error during OAuth discovery.")
+        return
+
+    auth_meta = oauth_config.auth_server_metadata
+    resource_meta = oauth_config.resource_metadata
+
+    if ctx.obj["json_mode"]:
+        output.success({
+            "server": server,
+            "resource_uri": oauth_config.resource_uri,
+            "issuer": auth_meta.issuer,
+            "authorization_endpoint": auth_meta.authorization_endpoint,
+            "token_endpoint": auth_meta.token_endpoint,
+            "registration_endpoint": auth_meta.registration_endpoint,
+            "revocation_endpoint": auth_meta.revocation_endpoint,
+            "scopes_supported": auth_meta.scopes_supported,
+            "grant_types_supported": auth_meta.grant_types_supported,
+            "supports_dcr": auth_meta.supports_dcr(),
+            "supports_pkce": auth_meta.supports_pkce(),
+            "supports_revocation": auth_meta.supports_revocation(),
+            "resource_scopes": resource_meta.scopes_supported if resource_meta else None,
+        })
+    else:
+        click.secho(f"OAuth Discovery for [{server}]:\n", bold=True)
+        click.echo(f"  Resource URI: {oauth_config.resource_uri}")
+        click.echo(f"  Issuer: {auth_meta.issuer}")
+        click.echo()
+
+        click.secho("  Endpoints:", bold=True)
+        click.echo(f"    Authorization: {auth_meta.authorization_endpoint}")
+        click.echo(f"    Token: {auth_meta.token_endpoint}")
+        if auth_meta.registration_endpoint:
+            click.echo(f"    Registration (DCR): {auth_meta.registration_endpoint}")
+        if auth_meta.revocation_endpoint:
+            click.echo(f"    Revocation: {auth_meta.revocation_endpoint}")
+        click.echo()
+
+        click.secho("  Capabilities:", bold=True)
+        click.echo(f"    PKCE (S256): {'Yes' if auth_meta.supports_pkce() else 'No'}")
+        click.echo(f"    DCR: {'Yes' if auth_meta.supports_dcr() else 'No'}")
+        click.echo(f"    Revocation: {'Yes' if auth_meta.supports_revocation() else 'No'}")
+        click.echo()
+
+        click.secho("  Scopes:", bold=True)
+        if auth_meta.scopes_supported:
+            for s in auth_meta.scopes_supported:
+                marker = " <--" if s == "offline_access" else ""
+                click.echo(f"    - {s}{marker}")
+            if "offline_access" not in auth_meta.scopes_supported:
+                click.secho(
+                    "    (offline_access NOT listed — mcpl will still request it)",
+                    fg="yellow",
+                )
+        else:
+            click.echo("    (server does not advertise scopes)")
+        click.echo()
+
+        click.echo(f"  Grant types: {', '.join(auth_meta.grant_types_supported)}")
+
+
 @auth.command("logout")
 @click.argument("server", required=False)
 @click.option("--all", "logout_all", is_flag=True, help="Clear all stored tokens and credentials")
@@ -1534,13 +1733,18 @@ def auth_status(ctx: click.Context, server: str | None) -> None:
                 if status.scope:
                     click.echo(f"  Scopes: {status.scope}")
 
-                # Show when token was issued
+                # Show when token was issued and original lifetime
                 if status.issued_ago_human:
                     click.echo(f"  Issued: {status.issued_ago_human}")
+                if status.token_lifetime_human:
+                    click.echo(f"  Token Lifetime: {status.token_lifetime_human}")
 
                 if status.expired:
                     click.echo()
-                    click.secho(f"  Run: mcpl auth login {server}", fg="cyan")
+                    if status.has_refresh_token:
+                        click.secho(f"  Try: mcpl auth refresh {server}", fg="cyan")
+                    else:
+                        click.secho(f"  Run: mcpl auth login {server}", fg="cyan")
             else:
                 click.secho("  Status: ", nl=False)
                 click.secho("Not authenticated", fg="red")

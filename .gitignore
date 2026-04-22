@@ -11,6 +11,7 @@ wheels/
 
 # secrets
 .env
+.mcp.json
 .claude/
 docs/traces/
 .coverage

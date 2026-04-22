@@ -221,14 +221,30 @@ def build_authorization_url(
         requested_scopes = []
 
     # Add offline_access for long-lived refresh tokens (enables agent use)
-    # Only add if: server supports it OR server doesn't advertise scopes (unknown scopes ignored per spec)
+    # Only add if: server doesn't advertise scopes (safe, spec says ignore unknown)
+    #              OR server explicitly lists offline_access as supported
+    # Some servers (e.g., Slack) reject unknown scopes instead of ignoring them.
     if "offline_access" not in requested_scopes:
         server_scopes = auth_server_metadata.scopes_supported
         if server_scopes is None or "offline_access" in server_scopes:
             requested_scopes.append("offline_access")
+            logger.debug(
+                f"Added offline_access scope (server scopes_supported: "
+                f"{server_scopes})"
+            )
+        else:
+            logger.debug(
+                f"Skipped offline_access — server advertises scopes without it: "
+                f"{server_scopes}"
+            )
 
     if requested_scopes:
         params["scope"] = " ".join(requested_scopes)
+
+    logger.info(
+        f"Authorization request scopes: {requested_scopes} "
+        f"(server advertised: {auth_server_metadata.scopes_supported})"
+    )
 
     auth_url = auth_server_metadata.authorization_endpoint
     return f"{auth_url}?{urlencode(params)}"
@@ -699,6 +715,16 @@ class OAuthFlow:
                 token = TokenSet.from_token_response(
                     token_response,
                     oauth_config.resource_uri,
+                )
+
+                # Log token details for debugging auth persistence
+                lifetime = ""
+                if token.expires_at and token.issued_at:
+                    secs = (token.expires_at - token.issued_at).total_seconds()
+                    lifetime = f", lifetime={secs:.0f}s"
+                logger.info(
+                    f"Token received: has_refresh_token={token.has_refresh_token()}, "
+                    f"scope={token.scope}{lifetime}"
                 )
 
                 self.token_store.set_token(oauth_config.resource_uri, token)

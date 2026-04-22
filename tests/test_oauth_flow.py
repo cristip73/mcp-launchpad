@@ -136,7 +136,11 @@ class TestBuildAuthorizationUrl:
         assert "offline_access" in url
 
     def test_does_not_add_offline_access_when_server_excludes_it(self) -> None:
-        """Test that offline_access is NOT added when server doesn't support it."""
+        """Test that offline_access is NOT added when server doesn't support it.
+
+        Some servers (e.g., Slack) reject unknown scopes with invalid_scope error
+        instead of ignoring them. We only add offline_access when safe to do so.
+        """
         metadata = AuthServerMetadata(
             issuer="https://auth.example.com",
             authorization_endpoint="https://auth.example.com/authorize",

@@ -109,6 +109,7 @@ class AuthStatus:
     issued_ago_human: str | None = None
     has_refresh_token: bool = False
     scope: str | None = None
+    token_lifetime_human: str | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,6 +125,7 @@ class AuthStatus:
             "issued_ago_human": self.issued_ago_human,
             "has_refresh_token": self.has_refresh_token,
             "scope": self.scope,
+            "token_lifetime_human": self.token_lifetime_human,
             "error": self.error,
         }
 
@@ -141,6 +143,7 @@ class AuthStatus:
             issued_ago_human=data.get("issued_ago_human"),
             has_refresh_token=data.get("has_refresh_token", False),
             scope=data.get("scope"),
+            token_lifetime_human=data.get("token_lifetime_human"),
             error=data.get("error"),
         )
 
@@ -284,7 +287,7 @@ class OAuthManager:
         Returns:
             AuthStatus with current authentication state
         """
-        token = self._store.get_token(server_url)
+        token = self._lookup_token(server_url)
 
         if token is None:
             return AuthStatus(
@@ -313,6 +316,19 @@ class OAuthManager:
         if token.issued_at:
             issued_ago_human = _format_time_ago(token.issued_at)
 
+        # Calculate original token lifetime
+        token_lifetime_human = None
+        if token.expires_at and token.issued_at:
+            expires_at = token.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            issued_at = token.issued_at
+            if issued_at.tzinfo is None:
+                issued_at = issued_at.replace(tzinfo=timezone.utc)
+            lifetime = expires_at - issued_at
+            if lifetime.total_seconds() > 0:
+                token_lifetime_human = _format_timedelta(lifetime)
+
         return AuthStatus(
             server_url=server_url,
             server_name=server_name,
@@ -324,6 +340,7 @@ class OAuthManager:
             issued_ago_human=issued_ago_human,
             has_refresh_token=token.has_refresh_token(),
             scope=token.scope,
+            token_lifetime_human=token_lifetime_human,
         )
 
     async def authenticate(
@@ -391,7 +408,7 @@ class OAuthManager:
             True if token was refreshed or is still valid,
             False if refresh failed or no token exists
         """
-        token = self._store.get_token(server_url)
+        token = self._lookup_token(server_url)
         if token is None:
             logger.debug(f"No token stored for {server_url}, cannot refresh")
             return False
@@ -448,12 +465,31 @@ class OAuthManager:
                 oauth_config.resource_uri,
             )
 
-            self._store.set_token(server_url, new_token)
-            logger.info(f"Token refreshed for {server_url}")
+            # Preserve refresh_token if server didn't return a new one
+            # (many OAuth servers only return access_token on refresh)
+            if not new_token.has_refresh_token() and token.has_refresh_token():
+                new_token.refresh_token = token.refresh_token
+                logger.debug(
+                    f"Preserved existing refresh_token for {server_url} "
+                    f"(server didn't return new one)"
+                )
+
+            # Save under resource_uri (canonical key), not server_url
+            # to avoid duplicate entries in token store
+            store_key = oauth_config.resource_uri or server_url
+            self._store.set_token(store_key, new_token)
+            logger.info(f"Token refreshed for {store_key}")
             return True
 
         except TokenExchangeError as e:
-            logger.warning(f"Token refresh failed for {server_url}: {e}")
+            error_str = str(e)
+            if "invalid_grant" in error_str:
+                logger.warning(
+                    f"Refresh token revoked/expired for {server_url}: {e}. "
+                    f"User must re-authenticate with: mcpl auth login"
+                )
+            else:
+                logger.warning(f"Token refresh failed for {server_url}: {e}")
             return False
 
     async def refresh_proactively(self, server_url: str) -> bool:
@@ -468,7 +504,7 @@ class OAuthManager:
         Returns:
             True if token was refreshed, False if refresh failed
         """
-        token = self._store.get_token(server_url)
+        token = self._lookup_token(server_url)
         if token is None:
             return False
         if not token.has_refresh_token():
@@ -500,11 +536,31 @@ class OAuthManager:
                 token_response,
                 oauth_config.resource_uri,
             )
-            self._store.set_token(server_url, new_token)
-            logger.info(f"Token proactively refreshed for {server_url}")
+
+            # Preserve refresh_token if server didn't return a new one
+            if not new_token.has_refresh_token() and token.has_refresh_token():
+                new_token.refresh_token = token.refresh_token
+                logger.debug(
+                    f"Preserved existing refresh_token for {server_url} "
+                    f"(server didn't return new one on proactive refresh)"
+                )
+
+            # Save under resource_uri (canonical key), not server_url
+            store_key = oauth_config.resource_uri or server_url
+            self._store.set_token(store_key, new_token)
+            logger.info(f"Token proactively refreshed for {store_key}")
             return True
         except TokenExchangeError as e:
-            logger.warning(f"Proactive token refresh failed for {server_url}: {e}")
+            error_str = str(e)
+            if "invalid_grant" in error_str:
+                logger.warning(
+                    f"Refresh token revoked/expired for {server_url}: {e}. "
+                    f"User must re-authenticate with: mcpl auth login"
+                )
+            else:
+                logger.warning(
+                    f"Proactive token refresh failed for {server_url}: {e}"
+                )
             return False
 
     def logout(self, server_url: str) -> bool:
@@ -538,7 +594,7 @@ class OAuthManager:
             True if token was deleted, False if not found
         """
         # Get token before deleting
-        token = self._store.get_token(server_url)
+        token = self._lookup_token(server_url)
         if token is None:
             return False
 
