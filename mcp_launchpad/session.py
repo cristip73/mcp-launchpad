@@ -68,6 +68,15 @@ class SessionClient:
         response = await self._send_request(IPCMessage(action="status", payload={}))
         return response.payload
 
+    async def reconnect(self, server_name: str) -> dict[str, Any]:
+        """Request daemon to reconnect a failed server."""
+        response = await self._send_request(
+            IPCMessage(
+                action="reconnect", payload={"server": server_name}
+            )
+        )
+        return response.payload
+
     async def shutdown(self) -> None:
         """Request daemon shutdown."""
         try:

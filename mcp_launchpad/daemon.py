@@ -234,10 +234,16 @@ class Daemon:
                 if not state.connected:
                     continue
                 idle_time = now - state.last_used
-                if idle_time > SERVER_IDLE_TIMEOUT:
+                server_config = self.state.config.servers.get(name)
+                timeout = (
+                    server_config.idle_timeout
+                    if server_config and server_config.idle_timeout is not None
+                    else SERVER_IDLE_TIMEOUT
+                )
+                if idle_time > timeout:
                     logger.info(
                         f"Server '{name}' idle for {idle_time:.0f}s "
-                        f"(> {SERVER_IDLE_TIMEOUT}s), disconnecting"
+                        f"(> {timeout}s), disconnecting"
                     )
                     await self._disconnect_server(name)
 
@@ -736,6 +742,32 @@ class Daemon:
 
             elif action == "status":
                 return IPCMessage(action="result", payload=self._get_status())
+
+            elif action == "reconnect":
+                server_name = payload.get("server")
+                if not server_name:
+                    return IPCMessage(
+                        action="error",
+                        payload={"error": "Missing 'server' in payload"},
+                    )
+                server_state = self.state.servers.get(server_name)
+                if server_state:
+                    server_state.error = None
+                    server_state.connected = False
+                    server_state.session = None
+                old_task = self._connection_tasks.get(server_name)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                self._connection_tasks[server_name] = asyncio.create_task(
+                    self._connect_server(server_name)
+                )
+                return IPCMessage(
+                    action="result",
+                    payload={
+                        "success": True,
+                        "message": f"Reconnecting server '{server_name}'",
+                    },
+                )
 
             elif action == "shutdown":
                 self.state.running = False
