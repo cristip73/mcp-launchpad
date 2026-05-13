@@ -62,6 +62,8 @@ class ServerConfig:
     oauth_callback_port: int | None = None
     # Static API key (alternative to OAuth for agent-friendly auth)
     api_key: str | None = None
+    # Per-server idle timeout override (seconds). None = use global default.
+    idle_timeout: int | None = None
 
     def is_http(self) -> bool:
         """Check if this is an HTTP-based server."""
@@ -147,7 +149,11 @@ def discover_all_config_files() -> list[Path]:
         if not search_dir.exists() or not search_dir.is_dir():
             continue
 
-        for json_file in search_dir.glob("*.json"):
+        for json_file in search_dir.iterdir():
+            # Only consider .json files (including dotfiles like .mcp.json)
+            if not json_file.is_file() or not json_file.name.endswith(".json"):
+                continue
+
             # Check if filename contains "mcp" (case-insensitive)
             if "mcp" not in json_file.name.lower():
                 continue
@@ -299,6 +305,8 @@ def parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         oauth_callback_port=data.get("oauth_callback_port") or (data.get("oauth", {}) or {}).get("callbackPort"),
         # Static API key (alternative to OAuth)
         api_key=data.get("api_key"),
+        # Per-server idle timeout
+        idle_timeout=data.get("idle_timeout"),
     )
 
 
@@ -345,7 +353,7 @@ def load_config(
         searched = ", ".join(str(p) for p in CONFIG_SEARCH_DIRS)
         raise FileNotFoundError(
             f"No MCP config file found.\n\n"
-            f"Searched directories for *mcp*.json files:\n"
+            f"Searched directories for *.json files containing 'mcp' (including .mcp.json):\n"
             f"  {searched}\n\n"
             f"Create a config file with your MCP servers. Example (mcp.json):\n\n"
             f'{{\n  "mcpServers": {{\n'
