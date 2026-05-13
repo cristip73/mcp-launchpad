@@ -1,0 +1,14 @@
+1. **[High] Observation 3 (cache key mismatch)**: **Fix in this PR**
+- This is a real correctness issue, not just cleanliness. If cache keys keep DB trailing spaces while lookups use clean action names, you still get silent misses for those 5 actions.
+- Minimal clean fix: normalize action names at the boundary (`trim()` when reading from DB and when building/reading cache keys). This is small, local, and not overengineering.
+
+2. **[Medium] Observation 1 (workaround `in: [action, action + ' ']` vs DB trim)**: **Fix as follow-up**
+- For this bugfix PR, the current workaround is pragmatic and low-risk.
+- Clean-code direction should be a follow-up migration to normalize DB values (`TRIM(action)` for the known bad rows, ideally with a guard/check), then simplify code back to exact match.
+- Keep temporary compatibility until migration is deployed everywhere.
+
+3. **[Low] Observation 2 (inline lambda vs reusable function)**: **Leave as-is**
+- For one call site, inline is clearer and avoids premature abstraction.
+- Extract only if a second/third usage appears or if clinic-access rules diverge and need centralization.
+
+Overall opinion: PR addresses the reported bug with minimal blast radius. The only thing I’d strongly pull into this PR is the cache normalization (Observation 3).
