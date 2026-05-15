@@ -127,12 +127,14 @@ class Daemon:
         # Set up signal handlers for graceful shutdown
         self._setup_signal_handlers()
 
-        # Write PID file
-        self._write_pid_file()
-
         # Start IPC server
         await self._ipc_server.start()
         logger.info("IPC server started")
+
+        # Write PID file only after the socket is bound. This avoids a startup
+        # race where a second client sees a live PID before IPC is ready and
+        # tries to start another daemon for the same session.
+        self._write_pid_file()
 
         # Servers connect lazily on first use (no eager pre-connection).
         # This avoids spawning processes for MCPs that may never be called.
@@ -743,32 +745,6 @@ class Daemon:
             elif action == "status":
                 return IPCMessage(action="result", payload=self._get_status())
 
-            elif action == "reconnect":
-                server_name = payload.get("server")
-                if not server_name:
-                    return IPCMessage(
-                        action="error",
-                        payload={"error": "Missing 'server' in payload"},
-                    )
-                server_state = self.state.servers.get(server_name)
-                if server_state:
-                    server_state.error = None
-                    server_state.connected = False
-                    server_state.session = None
-                old_task = self._connection_tasks.get(server_name)
-                if old_task and not old_task.done():
-                    old_task.cancel()
-                self._connection_tasks[server_name] = asyncio.create_task(
-                    self._connect_server(server_name)
-                )
-                return IPCMessage(
-                    action="result",
-                    payload={
-                        "success": True,
-                        "message": f"Reconnecting server '{server_name}'",
-                    },
-                )
-
             elif action == "shutdown":
                 self.state.running = False
                 return IPCMessage(
@@ -1132,6 +1108,11 @@ class Daemon:
     def _remove_pid_file(self) -> None:
         """Remove the PID file."""
         pid_file = get_pid_file_path()
+        try:
+            if pid_file.exists() and pid_file.read_text().strip() != str(os.getpid()):
+                return
+        except OSError:
+            return
         pid_file.unlink(missing_ok=True)
 
     def _cleanup_orphaned_stderr_files(self) -> None:

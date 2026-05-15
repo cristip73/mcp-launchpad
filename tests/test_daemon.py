@@ -252,6 +252,20 @@ class TestDaemon:
                 daemon._remove_pid_file()
                 assert not pid_file.exists()
 
+    def test_remove_pid_file_does_not_remove_other_process_pid(self, mock_config, tmp_path):
+        """Test startup race: a losing daemon must not remove the winner's PID."""
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text(str(os.getpid() + 1))
+
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            with patch("mcp_launchpad.daemon.get_pid_file_path", return_value=pid_file):
+                daemon = Daemon(mock_config)
+
+                daemon._remove_pid_file()
+
+                assert pid_file.exists()
+                assert pid_file.read_text() == str(os.getpid() + 1)
+
     @pytest.mark.asyncio
     async def test_call_tool_extracts_text_content(self, mock_config):
         """Test that _call_tool extracts text content from result."""

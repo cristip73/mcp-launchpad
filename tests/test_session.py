@@ -161,6 +161,26 @@ class TestSessionClientDaemonManagement:
             assert result is False
 
     @pytest.mark.asyncio
+    async def test_is_daemon_running_keeps_responsive_socket_without_pid(
+        self, mock_config, tmp_path
+    ):
+        """Test startup race: socket can be ready before PID file is written."""
+        client = SessionClient(mock_config)
+        pid_file = tmp_path / "missing.pid"
+        socket_path = tmp_path / "mcpl.sock"
+        socket_path.touch()
+
+        with patch("mcp_launchpad.session.get_pid_file_path", return_value=pid_file):
+            with patch("mcp_launchpad.session.get_socket_path", return_value=socket_path):
+                with patch.object(client, "_daemon_responds", new_callable=AsyncMock) as mock_responds:
+                    mock_responds.return_value = True
+
+                    result = await client._is_daemon_running()
+
+                    assert result is True
+                    assert socket_path.exists()
+
+    @pytest.mark.asyncio
     async def test_start_daemon_spawns_detached_process(self, mock_config):
         """Test that _start_daemon spawns a detached subprocess."""
         client = SessionClient(mock_config)

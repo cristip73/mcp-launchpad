@@ -68,15 +68,6 @@ class SessionClient:
         response = await self._send_request(IPCMessage(action="status", payload={}))
         return response.payload
 
-    async def reconnect(self, server_name: str) -> dict[str, Any]:
-        """Request daemon to reconnect a failed server."""
-        response = await self._send_request(
-            IPCMessage(
-                action="reconnect", payload={"server": server_name}
-            )
-        )
-        return response.payload
-
     async def shutdown(self) -> None:
         """Request daemon shutdown."""
         try:
@@ -213,8 +204,11 @@ class SessionClient:
         socket_path = get_socket_path()
 
         if not pid_file.exists():
-            # No PID file - clean up any stale socket file
+            # A daemon may have bound the socket but not written its PID yet.
+            # If it responds, treat it as running instead of deleting its socket.
             if socket_path.exists():
+                if await self._daemon_responds():
+                    return True
                 socket_path.unlink(missing_ok=True)
             return False
 
@@ -230,6 +224,10 @@ class SessionClient:
             return False
 
         # Process is alive - now verify it responds to IPC requests.
+        return await self._daemon_responds()
+
+    async def _daemon_responds(self) -> bool:
+        """Return True when the daemon socket responds to a status ping."""
         # This sends an actual status message rather than just testing connectivity,
         # which is required on Windows where the named pipe server blocks on ReadFile.
         try:

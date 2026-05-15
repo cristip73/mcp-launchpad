@@ -1132,27 +1132,6 @@ def session_status(ctx: click.Context) -> None:
             )
 
 
-@session.command("reconnect")
-@click.argument("server")
-@click.pass_context
-def session_reconnect(ctx: click.Context, server: str) -> None:
-    """Reconnect a failed server without restarting the daemon."""
-    output: OutputHandler = ctx.obj["output"]
-    config = get_config(ctx)
-
-    session_client = SessionClient(config)
-    try:
-        result = asyncio.run(session_client.reconnect(server))
-        if ctx.obj["json_mode"]:
-            output.success(result)
-        else:
-            click.secho(
-                result.get("message", f"Reconnecting server '{server}'"), fg="green"
-            )
-    except Exception as e:
-        output.error(e, help_text="Is the daemon running? Try 'mcpl session status'.")
-
-
 @session.command("stop")
 @click.pass_context
 def session_stop(ctx: click.Context) -> None:
