@@ -26,14 +26,23 @@ from mcp_launchpad.platform import (
 @pytest.fixture
 def clear_ide_env(monkeypatch):
     """Clear all IDE-related environment variables for clean testing."""
+    monkeypatch.delenv("MCPL_SESSION_ID", raising=False)
+    monkeypatch.delenv("MCPL_PERSIST", raising=False)
+    monkeypatch.delenv("WT_SESSION", raising=False)
     monkeypatch.delenv("VSCODE_GIT_IPC_HANDLE", raising=False)
     monkeypatch.delenv("CLAUDECODE", raising=False)
     monkeypatch.delenv("VSCODE_INJECTION", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SSE_PORT", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.delenv("CODEX_CI", raising=False)
 
 
 class TestIsIdeEnvironment:
     """Tests for is_ide_environment function."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, clear_ide_env):
+        """Start each IDE detection test without inherited IDE markers."""
 
     def test_detects_vscode_git_ipc_handle(self, monkeypatch):
         """Test detection of VS Code via VSCODE_GIT_IPC_HANDLE."""
@@ -88,11 +97,37 @@ class TestIsIdeEnvironment:
         monkeypatch.delenv("VSCODE_GIT_IPC_HANDLE", raising=False)
         monkeypatch.delenv("CLAUDECODE", raising=False)
         monkeypatch.delenv("VSCODE_INJECTION", raising=False)
+        monkeypatch.delenv("MCPL_SESSION_ID", raising=False)
         monkeypatch.delenv("MCPL_PERSIST", raising=False)
         monkeypatch.delenv("WT_SESSION", raising=False)
         assert is_ide_environment() is False
 
         monkeypatch.setenv("MCPL_PERSIST", "1")
+        assert is_ide_environment() is True
+
+    def test_detects_explicit_mcpl_session_id(self, clear_ide_env, monkeypatch):
+        """Test that explicit sessions use persistent daemon monitoring."""
+        assert is_ide_environment() is False
+
+        monkeypatch.setenv("MCPL_SESSION_ID", "custom-session")
+        assert is_ide_environment() is True
+
+    def test_detects_claude_code_sse_port(self, clear_ide_env, monkeypatch):
+        """Test detection of Claude Code via SSE port session marker."""
+        assert is_ide_environment() is False
+
+        monkeypatch.setenv("CLAUDE_CODE_SSE_PORT", "12345")
+        assert is_ide_environment() is True
+
+    def test_detects_codex_env(self, clear_ide_env, monkeypatch):
+        """Test detection of Codex transient subprocess environments."""
+        assert is_ide_environment() is False
+
+        monkeypatch.setenv("CODEX_THREAD_ID", "thread-123")
+        assert is_ide_environment() is True
+
+        monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+        monkeypatch.setenv("CODEX_CI", "1")
         assert is_ide_environment() is True
 
 

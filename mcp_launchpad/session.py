@@ -9,9 +9,6 @@ import time
 from typing import Any
 
 from .config import Config
-
-# Logger for session client
-logger = logging.getLogger("mcpl.session")
 from .ipc import IPCMessage, connect_to_daemon, read_message, write_message
 from .platform import (
     IS_WINDOWS,
@@ -23,6 +20,9 @@ from .platform import (
     get_socket_path,
     is_process_alive,
 )
+
+# Logger for session client
+logger = logging.getLogger("mcpl.session")
 
 # How long to wait for daemon to start (seconds) - configurable via env
 DAEMON_START_TIMEOUT = int(os.environ.get("MCPL_DAEMON_START_TIMEOUT", "30"))
@@ -71,8 +71,29 @@ class SessionClient:
     async def shutdown(self) -> None:
         """Request daemon shutdown."""
         try:
-            await self._send_request(IPCMessage(action="shutdown", payload={}))
-            logger.debug("Daemon shutdown request sent successfully")
+            if not await self._is_daemon_running():
+                logger.debug("No running daemon found for shutdown")
+                return
+
+            connection = await connect_to_daemon()
+            if not connection:
+                logger.debug("No daemon connection available for shutdown")
+                return
+
+            reader, writer = connection
+            try:
+                await write_message(writer, IPCMessage(action="shutdown", payload={}))
+                await read_message(reader)
+                logger.debug("Daemon shutdown request sent successfully")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+            start_time = time.time()
+            while time.time() - start_time < DAEMON_START_TIMEOUT:
+                if not await self._is_daemon_running():
+                    return
+                await asyncio.sleep(DAEMON_CONNECT_RETRY_DELAY)
         except Exception as e:
             # Daemon may close connection before responding - this is expected
             logger.debug(f"Daemon shutdown request completed (connection closed: {e})")
@@ -245,7 +266,7 @@ class SessionClient:
             finally:
                 writer.close()
                 await writer.wait_closed()
-        except (asyncio.TimeoutError, OSError, Exception) as e:
+        except (TimeoutError, OSError, Exception) as e:
             logger.debug(f"Daemon ping failed: {e}")
             return False
 

@@ -90,24 +90,62 @@ class TestSessionClient:
         """Test that shutdown sends the correct IPC message."""
         client = SessionClient(mock_config)
 
-        with patch.object(client, "_send_request", new_callable=AsyncMock) as mock_send:
-            mock_send.return_value = IPCMessage(action="result", payload={})
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
 
-            await client.shutdown()
+        with patch.object(client, "_is_daemon_running", new_callable=AsyncMock) as mock_running:
+            mock_running.side_effect = [True, False]
+            with patch(
+                "mcp_launchpad.session.connect_to_daemon", new_callable=AsyncMock
+            ) as mock_connect:
+                mock_connect.return_value = (mock_reader, mock_writer)
+                with patch(
+                    "mcp_launchpad.session.write_message", new_callable=AsyncMock
+                ) as mock_write:
+                    with patch(
+                        "mcp_launchpad.session.read_message", new_callable=AsyncMock
+                    ) as mock_read:
+                        mock_read.return_value = IPCMessage(action="result", payload={})
 
-            call_args = mock_send.call_args[0][0]
-            assert call_args.action == "shutdown"
+                        await client.shutdown()
+
+                        call_args = mock_write.call_args[0][1]
+                        assert call_args.action == "shutdown"
+
+        mock_writer.close.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_shutdown_ignores_connection_errors(self, mock_config):
         """Test that shutdown doesn't raise on connection errors."""
         client = SessionClient(mock_config)
 
-        with patch.object(client, "_send_request", new_callable=AsyncMock) as mock_send:
-            mock_send.side_effect = RuntimeError("Connection closed")
+        with patch.object(client, "_is_daemon_running", new_callable=AsyncMock) as mock_running:
+            mock_running.return_value = True
+            with patch(
+                "mcp_launchpad.session.connect_to_daemon", new_callable=AsyncMock
+            ) as mock_connect:
+                mock_connect.side_effect = RuntimeError("Connection closed")
 
-            # Should not raise
-            await client.shutdown()
+                # Should not raise
+                await client.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_start_daemon_when_absent(self, mock_config):
+        """Test that shutdown does not spawn a daemon just to stop it."""
+        client = SessionClient(mock_config)
+
+        with patch.object(client, "_is_daemon_running", new_callable=AsyncMock) as mock_running:
+            mock_running.return_value = False
+            with patch.object(client, "_start_daemon", new_callable=AsyncMock) as mock_start:
+                with patch(
+                    "mcp_launchpad.session.connect_to_daemon", new_callable=AsyncMock
+                ) as mock_connect:
+                    await client.shutdown()
+
+                    mock_start.assert_not_called()
+                    mock_connect.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_request_raises_on_error_response(self, mock_config):

@@ -29,11 +29,19 @@ def is_ide_environment() -> bool:
     subprocess. Instead, the daemon should stay alive using idle timeout.
 
     Detected environments:
+    - Explicit session ID (MCPL_SESSION_ID)
     - VS Code (VSCODE_GIT_IPC_HANDLE or VSCODE_INJECTION)
-    - Claude Code (CLAUDECODE)
+    - Claude Code (CLAUDECODE or CLAUDE_CODE_SSE_PORT)
+    - Codex (CODEX_THREAD_ID or CODEX_CI)
     - Windows Terminal (WT_SESSION)
     - Explicit opt-in (MCPL_PERSIST)
     """
+    # Explicit session IDs are durable by definition. The daemon is detached,
+    # so monitoring the short-lived CLI process that spawned it can kill slow
+    # cold starts before the first request finishes.
+    if os.environ.get("MCPL_SESSION_ID"):
+        return True
+
     # Explicit persistent mode requested
     if os.environ.get("MCPL_PERSIST"):
         return True
@@ -48,6 +56,13 @@ def is_ide_environment() -> bool:
 
     # Claude Code sets CLAUDECODE=1
     if os.environ.get("CLAUDECODE"):
+        return True
+
+    # Claude Code/Codex invocations often run commands in transient subprocesses.
+    if os.environ.get("CLAUDE_CODE_SSE_PORT"):
+        return True
+
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_CI"):
         return True
 
     # VS Code injection marker
