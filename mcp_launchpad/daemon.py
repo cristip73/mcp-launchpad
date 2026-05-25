@@ -62,6 +62,10 @@ def _get_backoff_delay(attempt: int, base_delay: int = RECONNECT_DELAY) -> int:
     delay = base_delay * (2 ** (attempt - 1))
     return int(min(delay, 60))  # Cap at 60 seconds
 
+# Tool call timeout (seconds) - 0 to disable
+# If a tool call doesn't return within this time, it's cancelled and the server is disconnected.
+TOOL_CALL_TIMEOUT = int(os.environ.get("MCPL_TOOL_CALL_TIMEOUT", "60"))
+
 # Per-server idle timeout (seconds) - 0 to disable
 # If a server hasn't received a call in this time, it will be disconnected.
 # It reconnects lazily on next use.
@@ -878,8 +882,24 @@ class Daemon:
 
         # Call the tool (update last_used after to prevent idle disconnect during long calls)
         try:
-            result = await server_state.session.call_tool(tool_name, arguments)
+            if TOOL_CALL_TIMEOUT > 0:
+                async with asyncio.timeout(TOOL_CALL_TIMEOUT):
+                    result = await server_state.session.call_tool(tool_name, arguments)
+            else:
+                result = await server_state.session.call_tool(tool_name, arguments)
             server_state.last_used = time.time()
+        except TimeoutError:
+            logger.error(
+                f"Tool '{tool_name}' on '{server_name}' timed out "
+                f"after {TOOL_CALL_TIMEOUT}s, disconnecting server"
+            )
+            await self._disconnect_server(server_name)
+            return {
+                "result": f"Tool '{tool_name}' timed out after {TOOL_CALL_TIMEOUT}s. "
+                          f"Server '{server_name}' disconnected and will reconnect on next use.",
+                "error": True,
+                "error_type": "timeout",
+            }
         except Exception as e:
             # Handle MCP protocol errors (JSON-RPC errors)
             error_str = str(e)
