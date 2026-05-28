@@ -65,6 +65,7 @@ def _get_backoff_delay(attempt: int, base_delay: int = RECONNECT_DELAY) -> int:
 # Tool call timeout (seconds) - 0 to disable
 # If a tool call doesn't return within this time, it's cancelled and the server is disconnected.
 TOOL_CALL_TIMEOUT = int(os.environ.get("MCPL_TOOL_CALL_TIMEOUT", "60"))
+MAX_TOOL_CALL_TIMEOUT = 3600
 
 # Per-server idle timeout (seconds) - 0 to disable
 # If a server hasn't received a call in this time, it will be disconnected.
@@ -95,6 +96,7 @@ class ServerState:
     connected: bool = False
     error: str | None = None
     last_used: float = field(default_factory=time.time)  # For per-server idle timeout
+    active_calls: int = 0
 
 
 @dataclass
@@ -237,7 +239,7 @@ class Daemon:
             await asyncio.sleep(SERVER_IDLE_CHECK_INTERVAL)
             now = time.time()
             for name, state in list(self.state.servers.items()):
-                if not state.connected:
+                if not state.connected or state.active_calls > 0:
                     continue
                 idle_time = now - state.last_used
                 server_config = self.state.config.servers.get(name)
@@ -738,7 +740,8 @@ class Daemon:
         try:
             if action == "call_tool":
                 result = await self._call_tool(
-                    payload["server"], payload["tool"], payload.get("arguments", {})
+                    payload["server"], payload["tool"], payload.get("arguments", {}),
+                    timeout=payload.get("timeout"),
                 )
                 return IPCMessage(action="result", payload={"success": True, **result})
 
@@ -829,7 +832,8 @@ class Daemon:
         )
 
     async def _call_tool(
-        self, server_name: str, tool_name: str, arguments: dict[str, Any]
+        self, server_name: str, tool_name: str, arguments: dict[str, Any],
+        timeout: int | None = None,
     ) -> dict[str, Any]:
         """Call a tool on the specified server."""
         from .connection import ToolInfo
@@ -880,10 +884,16 @@ class Daemon:
                 "error_type": "tool_not_found",
             }
 
-        # Call the tool (update last_used after to prevent idle disconnect during long calls)
+        # Resolve effective timeout: per-request > global > disabled (0)
+        effective_timeout = TOOL_CALL_TIMEOUT
+        if timeout is not None and timeout > 0:
+            effective_timeout = min(timeout, MAX_TOOL_CALL_TIMEOUT)
+
+        server_state.last_used = time.time()
+        server_state.active_calls += 1
         try:
-            if TOOL_CALL_TIMEOUT > 0:
-                async with asyncio.timeout(TOOL_CALL_TIMEOUT):
+            if effective_timeout > 0:
+                async with asyncio.timeout(effective_timeout):
                     result = await server_state.session.call_tool(tool_name, arguments)
             else:
                 result = await server_state.session.call_tool(tool_name, arguments)
@@ -891,11 +901,11 @@ class Daemon:
         except TimeoutError:
             logger.error(
                 f"Tool '{tool_name}' on '{server_name}' timed out "
-                f"after {TOOL_CALL_TIMEOUT}s, disconnecting server"
+                f"after {effective_timeout}s, disconnecting server"
             )
             await self._disconnect_server(server_name)
             return {
-                "result": f"Tool '{tool_name}' timed out after {TOOL_CALL_TIMEOUT}s. "
+                "result": f"Tool '{tool_name}' timed out after {effective_timeout}s. "
                           f"Server '{server_name}' disconnected and will reconnect on next use.",
                 "error": True,
                 "error_type": "timeout",
@@ -930,6 +940,9 @@ class Daemon:
             else:
                 # Other protocol error - return as-is
                 return {"result": error_str, "error": True, "error_type": "mcp_error"}
+        finally:
+            if server_name in self.state.servers:
+                self.state.servers[server_name].active_calls -= 1
 
         # Extract content from MCP result
         result_data: Any

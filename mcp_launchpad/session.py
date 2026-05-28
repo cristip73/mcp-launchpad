@@ -40,18 +40,19 @@ class SessionClient:
         self.config = config
 
     async def call_tool(
-        self, server_name: str, tool_name: str, arguments: dict[str, Any]
+        self, server_name: str, tool_name: str, arguments: dict[str, Any],
+        timeout: int | None = None,
     ) -> dict[str, Any]:
         """Call a tool via the daemon."""
+        payload: dict[str, Any] = {
+            "server": server_name,
+            "tool": tool_name,
+            "arguments": arguments,
+        }
+        if timeout is not None:
+            payload["timeout"] = timeout
         response = await self._send_request(
-            IPCMessage(
-                action="call_tool",
-                payload={
-                    "server": server_name,
-                    "tool": tool_name,
-                    "arguments": arguments,
-                },
-            )
+            IPCMessage(action="call_tool", payload=payload)
         )
         return response.payload
 

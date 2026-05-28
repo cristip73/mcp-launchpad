@@ -653,6 +653,13 @@ def _truncate_output(
     default=None,
     help="Max output chars (0=unlimited, default: 40000 or MCPL_MAX_OUTPUT_CHARS env var)",
 )
+@click.option(
+    "--timeout",
+    "-t",
+    type=click.IntRange(min=1, max=3600),
+    default=None,
+    help="Tool call timeout in seconds (default: 60 or MCPL_TOOL_CALL_TIMEOUT, max: 3600)",
+)
 @click.pass_context
 def call(
     ctx: click.Context,
@@ -662,6 +669,7 @@ def call(
     stdin: bool,
     no_daemon: bool,
     max_chars: int | None,
+    timeout: int | None,
 ) -> None:
     """Execute a tool on a server.
 
@@ -786,7 +794,7 @@ def call(
             # Call the tool via session daemon (maintains persistent connections)
             logger.debug(f"Calling {server}/{tool} via daemon")
             session = SessionClient(config)
-            result = asyncio.run(session.call_tool(server, tool, args_dict))
+            result = asyncio.run(session.call_tool(server, tool, args_dict, timeout=timeout))
             # Result is already extracted by the daemon (and errors enriched)
             result_data = result.get("result", result)
 
