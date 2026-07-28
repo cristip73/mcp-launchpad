@@ -8,8 +8,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import mcp_launchpad.state as state_module
 from mcp_launchpad.config import Config, ServerConfig
 from mcp_launchpad.connection import ToolInfo
+
+
+@pytest.fixture
+def isolated_state(tmp_path: Path, monkeypatch) -> Path:
+    """Point ServerState at a temp state file so tests don't touch ~/.cache."""
+    state_dir = tmp_path / "state"
+    state_file = state_dir / "server_state.json"
+    monkeypatch.setattr(state_module, "STATE_DIR", state_dir)
+    monkeypatch.setattr(state_module, "STATE_FILE", state_file)
+    return state_file
 
 # ============================================================================
 # Sample Data Fixtures

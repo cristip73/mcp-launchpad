@@ -14,7 +14,12 @@ STATE_FILE = STATE_DIR / "server_state.json"
 class ServerState:
     """Manages the enabled/disabled state of MCP servers.
 
-    This state is managed by mcpl independently of the config file.
+    A server is disabled if EITHER source says so:
+    - Declarative: ``"disabled": true`` on the server entry in the config file
+      (versioned, per-project; edit the file to change it).
+    - Runtime: ``mcpl disable <server>`` (per-machine, persisted in the state
+      file under ~/.cache/mcp-launchpad/).
+
     By default, all servers in the config are enabled.
     """
 
@@ -52,18 +57,46 @@ class ServerState:
         with open(self.state_file, "w") as f:
             json.dump({"disabled_servers": sorted(self._disabled_servers)}, f, indent=2)
 
+    def _config_disabled(self, server_name: str) -> bool:
+        """Check if a server is disabled declaratively in the config file."""
+        server = self.config.servers.get(server_name)
+        return server is not None and server.disabled
+
+    def disabled_source(self, server_name: str) -> str | None:
+        """Return why a server is disabled: 'config', 'runtime', or None.
+
+        'config' takes precedence in reporting because it cannot be
+        overridden by `mcpl enable` - the user must edit the config file.
+        """
+        if self._config_disabled(server_name):
+            return "config"
+        if server_name in self._disabled_servers:
+            return "runtime"
+        return None
+
     def is_enabled(self, server_name: str) -> bool:
         """Check if a server is enabled."""
-        return server_name not in self._disabled_servers
+        return not self.is_disabled(server_name)
 
     def is_disabled(self, server_name: str) -> bool:
-        """Check if a server is disabled."""
-        return server_name in self._disabled_servers
+        """Check if a server is disabled (config file OR runtime state)."""
+        return self.disabled_source(server_name) is not None
 
     def enable(self, server_name: str) -> bool:
-        """Enable a server. Returns True if state changed."""
+        """Enable a server. Returns True if state changed.
+
+        Raises ValueError if the server is unknown, or if it is disabled
+        declaratively in the config file (runtime enable cannot override it).
+        """
         if server_name not in self.config.servers:
             raise ValueError(f"Server '{server_name}' not found in config")
+
+        if self._config_disabled(server_name):
+            config_path = self.config.config_path or "the config file"
+            raise ValueError(
+                f"Server '{server_name}' is disabled in {config_path} "
+                f'("disabled": true). Remove that line to re-enable it.'
+            )
 
         if server_name in self._disabled_servers:
             self._disabled_servers.remove(server_name)
@@ -72,7 +105,7 @@ class ServerState:
         return False
 
     def disable(self, server_name: str) -> bool:
-        """Disable a server. Returns True if state changed."""
+        """Disable a server at runtime. Returns True if state changed."""
         if server_name not in self.config.servers:
             raise ValueError(f"Server '{server_name}' not found in config")
 
@@ -87,17 +120,20 @@ class ServerState:
         return {
             name: cfg
             for name, cfg in self.config.servers.items()
-            if name not in self._disabled_servers
+            if self.is_enabled(name)
         }
 
     def get_disabled_servers(self) -> list[str]:
-        """Get list of disabled server names."""
-        return sorted(self._disabled_servers)
+        """Get sorted list of disabled server names (both sources)."""
+        return sorted(
+            name for name in self.config.servers if self.is_disabled(name)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Get state as a dictionary."""
+        disabled = self.get_disabled_servers()
         return {
-            "disabled_servers": sorted(self._disabled_servers),
-            "enabled_count": len(self.config.servers) - len(self._disabled_servers),
-            "disabled_count": len(self._disabled_servers),
+            "disabled_servers": disabled,
+            "enabled_count": len(self.config.servers) - len(disabled),
+            "disabled_count": len(disabled),
         }

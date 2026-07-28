@@ -125,6 +125,21 @@ def _check_tool_exists(
         return True, []
 
 
+def _disabled_error(server: str, source: str, config: Config) -> tuple[Exception, str]:
+    """Build the (exception, help_text) pair for a disabled-server refusal."""
+    if source == "config":
+        config_path = config.config_path or "the config file"
+        exc = ValueError(f"Server '{server}' is disabled in {config_path}")
+        help_text = (
+            f'The server entry has "disabled": true in {config_path}.\n'
+            f"Remove that line to re-enable it."
+        )
+    else:
+        exc = ValueError(f"Server '{server}' is disabled (via 'mcpl disable')")
+        help_text = f"Run 'mcpl enable {server}' to re-enable it."
+    return exc, help_text
+
+
 def _handle_mcp_exception(
     e: Exception, server: str, tool: str, available_tools: list[ToolInfo]
 ) -> dict[str, Any] | None:
@@ -448,11 +463,13 @@ def search(
     config = get_config(ctx)
 
     cache = ToolCache(config)
+    state = ServerState(config)
 
-    # Get or refresh tools
+    # Get or refresh tools (refresh only touches enabled servers)
     if refresh or not cache.is_cache_valid():
+        enabled_servers = list(state.get_enabled_servers().keys())
         try:
-            tools = asyncio.run(cache.refresh())
+            tools = asyncio.run(cache.refresh(force=refresh, servers=enabled_servers))
         except Exception as e:
             output.error(
                 e, help_text="Failed to refresh tool cache. Check server connections."
@@ -460,6 +477,9 @@ def search(
             return
     else:
         tools = cache.get_tools()
+
+    # Hide tools from disabled servers (the cache may still hold them)
+    tools = [t for t in tools if not state.is_disabled(t.server)]
 
     if not tools:
         output.error(
@@ -689,6 +709,13 @@ def call(
     """
     output: OutputHandler = ctx.obj["output"]
     config = get_config(ctx)
+
+    # Fail fast on disabled servers, before any daemon/connection work
+    disabled_source = ServerState(config).disabled_source(server)
+    if disabled_source is not None:
+        exc, help_text = _disabled_error(server, disabled_source, config)
+        output.error(exc, error_type="ServerDisabled", help_text=help_text)
+        return
 
     # Parse arguments from extra_args (supports both JSON and --key value)
     arguments: str | None = None
@@ -972,7 +999,12 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
                 for name in disabled_servers:
                     click.secho(f"  [{name}] ", fg="cyan", nl=False)
                     click.secho("SKIPPED", dim=True, nl=False)
-                    click.echo(" (disabled)")
+                    source = state.disabled_source(name)
+                    click.echo(
+                        " (disabled in .mcp.json)"
+                        if source == "config"
+                        else " (disabled)"
+                    )
 
             # Handle servers that need OAuth authentication
             if oauth_required_servers and not ctx.obj["json_mode"]:
@@ -989,10 +1021,11 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
 
     if server:
         # List tools for specific server
+        server_disabled_source = state.disabled_source(server)
         tools = cache.get_tools()
         server_tools = [t for t in tools if t.server == server]
 
-        if not server_tools:
+        if not server_tools and server_disabled_source is None:
             # Try fetching directly
             manager = ConnectionManager(config)
             try:
@@ -1013,6 +1046,8 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
             output.success(
                 {
                     "server": server,
+                    "disabled": server_disabled_source is not None,
+                    "disabledSource": server_disabled_source,
                     "tools": [
                         {
                             "name": t.name,
@@ -1024,6 +1059,18 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
                 }
             )
         else:
+            if server_disabled_source == "config":
+                click.secho(
+                    f"\nServer '{server}' is disabled in {config.config_path} "
+                    f'("disabled": true). Remove that line to re-enable it.',
+                    fg="yellow",
+                )
+            elif server_disabled_source == "runtime":
+                click.secho(
+                    f"\nServer '{server}' is disabled. "
+                    f"Run 'mcpl enable {server}' to re-enable it.",
+                    fg="yellow",
+                )
             click.secho(f"\nTools for [{server}]:\n", bold=True)
             for t in server_tools:
                 click.secho(f"  {t.name}", fg="green", bold=True)
@@ -1046,8 +1093,10 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
         servers_data: list[dict[str, Any]] = []
         for name in config.servers:
             tool_count = server_tool_counts.get(name, 0)
-            is_disabled = state.is_disabled(name)
-            if is_disabled:
+            disabled_source = state.disabled_source(name)
+            if disabled_source == "config":
+                status = "disabled (.mcp.json)"
+            elif disabled_source == "runtime":
                 status = "disabled"
             elif tool_count > 0:
                 status = "cached"
@@ -1058,7 +1107,8 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
                     "name": name,
                     "status": status,
                     "tools": tool_count,
-                    "disabled": is_disabled,
+                    "disabled": disabled_source is not None,
+                    "disabledSource": disabled_source,
                 }
             )
 
@@ -1067,7 +1117,7 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
         else:
             click.secho("\nConfigured MCP Servers:\n", bold=True)
             for s in servers_data:
-                if s["status"] == "disabled":
+                if s["disabled"]:
                     status_color = "red"
                 elif s["status"] == "cached":
                     status_color = "green"
@@ -1075,7 +1125,7 @@ def list_cmd(ctx: click.Context, server: str | None, refresh: bool) -> None:
                     status_color = "yellow"
                 click.secho(f"  [{s['name']}] ", fg="cyan", nl=False)
                 click.secho(f"{s['status']}", fg=status_color, nl=False)
-                if s["tools"] > 0:
+                if s["tools"] > 0 and not s["disabled"]:
                     click.echo(f" ({s['tools']} tools)")
                 else:
                     click.echo()
@@ -1901,7 +1951,10 @@ def verify(ctx: click.Context, timeout: int) -> None:
         for server_name in disabled_servers:
             click.secho(f"  [{server_name}] ", fg="cyan", nl=False)
             click.secho("SKIPPED", dim=True, nl=False)
-            click.echo(" (disabled)")
+            source = state.disabled_source(server_name)
+            click.echo(
+                " (disabled in .mcp.json)" if source == "config" else " (disabled)"
+            )
 
     # Restore original timeout
     if old_timeout is not None:
@@ -1964,6 +2017,7 @@ def config(ctx: click.Context, show_secrets: bool) -> None:
             server_info: dict[str, Any] = {
                 "type": server.server_type,
                 "disabled": state.is_disabled(name),
+                "disabledSource": state.disabled_source(name),
             }
             if server.is_http():
                 server_info["url"] = server.url
@@ -2002,7 +2056,10 @@ def config(ctx: click.Context, show_secrets: bool) -> None:
         click.secho("\nConfigured Servers:\n", bold=True)
         for name, server in cfg.servers.items():
             click.secho(f"  [{name}]", fg="cyan", bold=True, nl=False)
-            if state.is_disabled(name):
+            source = state.disabled_source(name)
+            if source == "config":
+                click.secho(" (disabled in .mcp.json)", fg="red")
+            elif source == "runtime":
                 click.secho(" (disabled)", fg="red")
             else:
                 click.echo()
@@ -2246,9 +2303,13 @@ def enable(ctx: click.Context, server: str) -> None:
             else:
                 click.echo(f"Server '{server}' was already enabled.")
     except ValueError as e:
-        output.error(
-            e, help_text=f"Available servers: {', '.join(config.servers.keys())}"
-        )
+        if server in config.servers:
+            # Known server, but disabled declaratively in the config file
+            output.error(e, error_type="ServerDisabled")
+        else:
+            output.error(
+                e, help_text=f"Available servers: {', '.join(config.servers.keys())}"
+            )
 
 
 @main.command()

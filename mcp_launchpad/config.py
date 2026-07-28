@@ -64,6 +64,9 @@ class ServerConfig:
     api_key: str | None = None
     # Per-server idle timeout override (seconds). None = use global default.
     idle_timeout: int | None = None
+    # Declarative disable: "disabled": true in the config file keeps the server
+    # defined but excluded from mcpl operations (call/search/refresh/verify).
+    disabled: bool = False
 
     def is_http(self) -> bool:
         """Check if this is an HTTP-based server."""
@@ -307,6 +310,8 @@ def parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         api_key=data.get("api_key"),
         # Per-server idle timeout
         idle_timeout=data.get("idle_timeout"),
+        # Declarative disable flag
+        disabled=bool(data.get("disabled", False)),
     )
 
 

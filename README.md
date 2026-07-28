@@ -196,6 +196,34 @@ mcpl disable slow-server    # Temporarily disable a server
 mcpl enable slow-server     # Re-enable it
 ```
 
+Disabled servers are refused by `call`, hidden from `search` results, and
+skipped during `refresh`/`verify`. This runtime state is per-machine
+(`~/.cache/mcp-launchpad/server_state.json`).
+
+### Disabling a server in the config file
+
+For a declarative, versioned disable, set `"disabled": true` on the server
+entry in your config file (e.g. `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "slow-server": {
+      "command": "npx",
+      "args": ["-y", "slow-mcp-server"],
+      "disabled": true
+    }
+  }
+}
+```
+
+The server stays defined (visible in `mcpl list` as `disabled (.mcp.json)`)
+but is refused by `call` and hidden from `search`. Remove the line to
+re-enable - the change takes effect immediately, no daemon restart needed.
+`mcpl enable` cannot override a config-file disable; it will tell you to
+edit the file instead. Claude Code and other consumers of `.mcp.json`
+ignore the extra field.
+
 ### `mcpl config`
 
 Show the current configuration and loaded servers.

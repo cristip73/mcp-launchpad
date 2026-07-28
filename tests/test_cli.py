@@ -493,3 +493,152 @@ class TestConfigErrors:
             result = runner.invoke(main, ["--config", str(custom_config), "list"])
 
             assert result.exit_code == 0
+
+
+class TestDisabledServers:
+    """Tests for the "disabled": true config flag + runtime disable enforcement."""
+
+    def _write_config(self, tmp_path: Path, github_disabled: bool = True) -> None:
+        config_data = {
+            "mcpServers": {
+                "github": {"command": "test", "disabled": github_disabled},
+                "sentry": {"command": "test"},
+            }
+        }
+        (tmp_path / "mcp.json").write_text(json.dumps(config_data))
+
+    def test_call_refused_when_disabled_in_config(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch, isolated_state
+    ):
+        """call on a config-disabled server fails fast, no daemon contact."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        with patch("mcp_launchpad.cli.SessionClient") as MockSession:
+            result = runner.invoke(main, ["call", "github", "create_issue"])
+
+            assert result.exit_code == 1
+            assert "disabled" in result.output
+            assert "mcp.json" in result.output
+            MockSession.assert_not_called()
+
+    def test_call_refused_when_disabled_at_runtime(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch, isolated_state
+    ):
+        """call on a runtime-disabled server points to 'mcpl enable'."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path, github_disabled=False)
+        isolated_state.parent.mkdir(parents=True)
+        isolated_state.write_text(json.dumps({"disabled_servers": ["github"]}))
+
+        with patch("mcp_launchpad.cli.SessionClient") as MockSession:
+            result = runner.invoke(main, ["call", "github", "create_issue"])
+
+            assert result.exit_code == 1
+            assert "mcpl enable github" in result.output
+            MockSession.assert_not_called()
+
+    def test_call_works_on_enabled_server(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch, isolated_state
+    ):
+        """Sibling server stays callable when another one is disabled."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        with patch("mcp_launchpad.cli.SessionClient") as MockSession:
+            mock_session = MagicMock()
+            mock_session.call_tool = AsyncMock(return_value={"result": "ok"})
+            MockSession.return_value = mock_session
+
+            result = runner.invoke(main, ["--json", "call", "sentry", "search_issues"])
+
+            assert result.exit_code == 0
+
+    def test_search_hides_disabled_server_tools(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        sample_tools: list[ToolInfo],
+        monkeypatch,
+        isolated_state,
+    ):
+        """Tools of disabled servers are filtered out of search results."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        with patch("mcp_launchpad.cli.ToolCache") as MockCache:
+            mock_cache = MagicMock()
+            mock_cache.is_cache_valid.return_value = True
+            mock_cache.get_tools.return_value = sample_tools
+            MockCache.return_value = mock_cache
+
+            # exact-match method: BM25 degenerates on a 2-doc corpus (idf=0)
+            result = runner.invoke(
+                main, ["--json", "search", "issues", "--method", "exact"]
+            )
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+            servers = {r["server"] for r in parsed["data"]["results"]}
+            assert "sentry" in servers
+            assert "github" not in servers
+
+    def test_list_shows_disabled_source(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch, isolated_state
+    ):
+        """mcpl list marks config-disabled servers with their source."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        with patch("mcp_launchpad.cli.ToolCache") as MockCache:
+            mock_cache = MagicMock()
+            mock_cache.get_tools.return_value = []
+            MockCache.return_value = mock_cache
+
+            result = runner.invoke(main, ["--json", "list"])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+            by_name = {s["name"]: s for s in parsed["data"]["servers"]}
+            assert by_name["github"]["disabled"] is True
+            assert by_name["github"]["disabledSource"] == "config"
+            assert by_name["sentry"]["disabled"] is False
+
+    def test_enable_config_disabled_gives_guidance(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch, isolated_state
+    ):
+        """mcpl enable cannot override the config file and says so."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        result = runner.invoke(main, ["enable", "github"])
+
+        assert result.exit_code == 1
+        assert "disabled in" in result.output
+        assert "Remove that line" in result.output
+
+    def test_search_refresh_skips_disabled_servers(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        sample_tools: list[ToolInfo],
+        monkeypatch,
+        isolated_state,
+    ):
+        """Auto-refresh triggered by search never touches disabled servers."""
+        monkeypatch.chdir(tmp_path)
+        self._write_config(tmp_path)
+
+        with patch("mcp_launchpad.cli.ToolCache") as MockCache:
+            mock_cache = MagicMock()
+            mock_cache.is_cache_valid.return_value = False
+            mock_cache.refresh = AsyncMock(return_value=sample_tools)
+            MockCache.return_value = mock_cache
+
+            result = runner.invoke(
+                main, ["--json", "search", "issues", "--method", "exact"]
+            )
+
+            assert result.exit_code == 0
+            _, kwargs = mock_cache.refresh.call_args
+            assert kwargs["servers"] == ["sentry"]
