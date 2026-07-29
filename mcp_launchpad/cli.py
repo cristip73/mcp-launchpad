@@ -804,8 +804,13 @@ def call(
             else:
                 result_data = result
 
-            # Check if tool returned an error (using MCP's isError field)
-            is_error = getattr(result, "isError", False)
+            # Check if tool returned an error (MCP's isError field, renamed to
+            # is_error in mcp SDK 2.x where isError is only a wire alias)
+            is_error = getattr(
+                result, "is_error", None
+            )
+            if is_error is None:
+                is_error = getattr(result, "isError", False)
             if is_error:
                 output.success({"result": result_data, "error": True})
                 return
@@ -836,7 +841,14 @@ def call(
                 result_data, char_limit, server, tool
             )
 
-            output.success({"result": result_data})
+            # Preserve the daemon's error flags so the daemon path reports tool
+            # errors the same way the direct path does.
+            payload: dict[str, Any] = {"result": result_data}
+            if result.get("error"):
+                payload["error"] = True
+                if result.get("error_type"):
+                    payload["error_type"] = result["error_type"]
+            output.success(payload)
     except Exception as e:
         # The error message from daemon/connection already includes context
         # Only add help text if not already present in the error message

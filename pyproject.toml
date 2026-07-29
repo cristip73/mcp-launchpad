@@ -5,7 +5,10 @@ description = "A lightweight CLI for efficiently discovering and executing MCP s
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "mcp>=1.0.0",
+    # Pinned to the 2.x line: 1.x is maintenance-only (security fixes) since
+    # 2026-07-28, and the two majors differ in client transport and model
+    # field names. An unbounded range silently jumps majors on rebuild.
+    "mcp>=2.0,<3",
     "httpx>=0.27.0",
     "click>=8.1.0",
     "rank-bm25>=0.2.2",

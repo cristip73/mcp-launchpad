@@ -415,9 +415,12 @@ class Daemon:
                         # streamable_http_client handle the error
                         pass
 
+                    # mcp SDK 1.x yields (read, write, get_session_id); 2.x yields
+                    # (read, write). Take the streams positionally to support both.
                     async with streamable_http_client(
                         url, http_client=http_client, terminate_on_close=False
-                    ) as (read, write, _get_session_id):
+                    ) as transport:
+                        read, write = transport[0], transport[1]
                         async with ClientSession(read, write) as session:
                             await session.initialize()
 
@@ -858,7 +861,9 @@ class Daemon:
                     server=server_name,
                     name=t.name,
                     description=t.description or "",
-                    input_schema=t.inputSchema if hasattr(t, "inputSchema") else {},
+                    input_schema=getattr(t, "input_schema", None)
+                    or getattr(t, "inputSchema", None)
+                    or {},
                 )
                 for t in tools_result.tools
             ]
@@ -959,8 +964,11 @@ class Daemon:
         else:
             result_data = result
 
-        # Check if tool returned an error (using MCP's isError field)
-        is_error = getattr(result, "isError", False)
+        # Check if tool returned an error (MCP's isError field, renamed to
+        # is_error in mcp SDK 2.x where isError is only a wire alias)
+        is_error = getattr(result, "is_error", None)
+        if is_error is None:
+            is_error = getattr(result, "isError", False)
         if is_error:
             # Tool explicitly marked result as error - return with error flag
             # but don't try to guess the error type from text
@@ -980,7 +988,9 @@ class Daemon:
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "inputSchema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                "inputSchema": getattr(tool, "input_schema", None)
+                or getattr(tool, "inputSchema", None)
+                or {},
             }
             for tool in result.tools
         ]

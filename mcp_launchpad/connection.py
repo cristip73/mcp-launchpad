@@ -295,9 +295,12 @@ class ConnectionManager:
                 # terminate_on_close=False: Skip DELETE request for session cleanup
                 # Many servers (like Supabase) don't implement this endpoint and return 404
                 # HTTP connections are stateless anyway, so cleanup happens naturally
+                # mcp SDK 1.x yields (read, write, get_session_id); 2.x yields
+                # (read, write). Take the streams positionally to support both.
                 async with streamable_http_client(
                     url, http_client=http_client, terminate_on_close=False
-                ) as (read, write, _get_session_id):
+                ) as transport:
+                    read, write = transport[0], transport[1]
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         logger.debug(f"HTTP connection to '{server_name}' initialized")
@@ -477,9 +480,13 @@ class ConnectionManager:
                     server=server_name,
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=tool.inputSchema
-                    if hasattr(tool, "inputSchema")
-                    else {},
+                    # mcp SDK 2.x renamed the attribute to input_schema
+                    # (inputSchema survives only as a serialization alias).
+                    input_schema=getattr(
+                        tool, "input_schema", None
+                    )
+                    or getattr(tool, "inputSchema", None)
+                    or {},
                 )
                 for tool in result.tools
             ]
