@@ -917,3 +917,28 @@ class TestDaemonSSETransport:
             assert captured_headers is not None
             assert "Authorization" in captured_headers
             assert captured_headers["Authorization"] == "Bearer test-api-key"
+
+    @pytest.mark.asyncio
+    async def test_sse_read_timeout_not_tied_to_connection_timeout(
+        self, sse_server_config
+    ):
+        """An idle SSE stream must not be dropped after the handshake timeout.
+
+        sse_read_timeout bounds the gap between events on a live stream, so it
+        uses SSE_READ_TIMEOUT (300s), not the 45s CONNECTION_TIMEOUT.
+        """
+        with patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345):
+            daemon = Daemon(sse_server_config)
+            daemon.state.running = True
+
+            captured_kwargs = {}
+
+            def mock_sse(url, **kwargs):
+                captured_kwargs.update(kwargs)
+                raise TimeoutError("Stop early")
+
+            with patch("mcp_launchpad.daemon.MAX_RECONNECT_ATTEMPTS", 1):
+                with patch("mcp_launchpad.daemon.sse_client", side_effect=mock_sse):
+                    await daemon._connect_server("sse-server")
+
+            assert captured_kwargs["sse_read_timeout"] == 300

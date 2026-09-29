@@ -51,6 +51,10 @@ class OAuthRequiredError(Exception):
 # Connection timeout in seconds (configurable via MCPL_CONNECTION_TIMEOUT env var)
 CONNECTION_TIMEOUT = int(os.environ.get("MCPL_CONNECTION_TIMEOUT", "45"))
 
+# How long an SSE stream may go without any event before it is dropped (seconds).
+# Separate from CONNECTION_TIMEOUT: a live stream is idle between messages.
+SSE_READ_TIMEOUT = int(os.environ.get("MCPL_SSE_READ_TIMEOUT", "300"))
+
 
 @dataclass
 class ServerConnection:
@@ -449,7 +453,7 @@ class ConnectionManager:
                     url,
                     headers=headers,
                     timeout=30.0,
-                    sse_read_timeout=CONNECTION_TIMEOUT,
+                    sse_read_timeout=SSE_READ_TIMEOUT,
                 ) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()

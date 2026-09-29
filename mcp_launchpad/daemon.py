@@ -19,7 +19,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from .config import Config, ServerConfig, load_config
-from .connection import OAuthRequiredError
+from .connection import SSE_READ_TIMEOUT, OAuthRequiredError
 from .ipc import IPCMessage, create_ipc_server
 from .oauth import get_oauth_manager
 from .platform import (
@@ -543,7 +543,7 @@ class Daemon:
                         url,
                         headers=headers,
                         timeout=30.0,
-                        sse_read_timeout=CONNECTION_TIMEOUT,
+                        sse_read_timeout=SSE_READ_TIMEOUT,
                     ) as (read, write):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
