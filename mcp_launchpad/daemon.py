@@ -351,7 +351,9 @@ class Daemon:
             server_state.http_client = http_client
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT):
+                # Timeout covers only the handshake (preflight + initialize); it is
+                # disarmed once connected, else it tears the live session down
+                async with asyncio.timeout(CONNECTION_TIMEOUT) as handshake_timeout:
                     # Preflight check: detect OAuth-requiring servers
                     # MCP servers requiring OAuth return 401 with WWW-Authenticate
                     try:
@@ -423,6 +425,7 @@ class Daemon:
                         read, write = transport[0], transport[1]
                         async with ClientSession(read, write) as session:
                             await session.initialize()
+                            handshake_timeout.reschedule(None)
 
                             server_state.session = session
                             server_state.connected = True
@@ -534,7 +537,8 @@ class Daemon:
                 server_state.error = None
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT):
+                # Timeout covers only the handshake; disarmed once connected
+                async with asyncio.timeout(CONNECTION_TIMEOUT) as handshake_timeout:
                     async with sse_client(
                         url,
                         headers=headers,
@@ -543,6 +547,7 @@ class Daemon:
                     ) as (read, write):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
+                            handshake_timeout.reschedule(None)
 
                             server_state.session = session
                             server_state.connected = True

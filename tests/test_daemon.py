@@ -1,6 +1,8 @@
 """Tests for session daemon."""
 
+import asyncio
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -489,6 +491,78 @@ class TestDaemonReconnectionBehavior:
                     await daemon._ensure_server_connected("test-server")
 
                 assert "timed out" in str(excinfo.value).lower()
+
+
+class TestDaemonNetworkConnectionLifetime:
+    """The handshake timeout must not bound how long a network connection stays up.
+
+    Regression: the HTTP and SSE paths wrapped the keep-alive loop inside
+    asyncio.timeout(CONNECTION_TIMEOUT), so every live session was torn down
+    and reconnected CONNECTION_TIMEOUT seconds after it opened, forever.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "server_type,transport_target",
+        [
+            ("http", "mcp_launchpad.daemon.streamable_http_client"),
+            ("sse", "mcp_launchpad.daemon.sse_client"),
+        ],
+    )
+    async def test_connection_outlives_handshake_timeout(
+        self, server_type, transport_target
+    ):
+        config = Config(
+            servers={
+                "net-server": ServerConfig(
+                    name="net-server",
+                    server_type=server_type,
+                    url="https://api.example.com/mcp",
+                    headers={"Authorization": "Bearer static"},
+                ),
+            },
+            config_path=Path("/tmp/test-config.json"),
+        )
+        opened = 0
+
+        @asynccontextmanager
+        async def fake_transport(*args, **kwargs):
+            nonlocal opened
+            opened += 1
+            yield (MagicMock(), MagicMock())
+
+        @asynccontextmanager
+        async def fake_session(read, write):
+            session = MagicMock()
+            session.initialize = AsyncMock()
+            yield session
+
+        preflight = MagicMock()
+        preflight.status_code = 200
+
+        with (
+            patch("mcp_launchpad.daemon.get_parent_pid", return_value=12345),
+            patch("mcp_launchpad.daemon.CONNECTION_TIMEOUT", 0.2),
+            patch("mcp_launchpad.daemon.RECONNECT_DELAY", 0.01),
+            patch(transport_target, fake_transport),
+            patch("mcp_launchpad.daemon.ClientSession", fake_session),
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=preflight
+            ),
+        ):
+            daemon = Daemon(config)
+            daemon.state.running = True
+            task = asyncio.create_task(daemon._connect_server("net-server"))
+            try:
+                # Several handshake timeouts elapse while the session is idle
+                await asyncio.sleep(1.2)
+                server_state = daemon.state.servers["net-server"]
+                assert server_state.connected is True
+                assert server_state.error is None
+                assert opened == 1
+            finally:
+                daemon.state.running = False
+                await asyncio.wait_for(task, timeout=5)
 
 
 class TestDaemonOAuthHandling:
