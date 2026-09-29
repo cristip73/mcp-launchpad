@@ -98,7 +98,8 @@ def get_session_id() -> str:
 
     Priority order:
     1. MCPL_SESSION_ID - explicit override for testing/advanced usage
-    2. TERM_SESSION_ID - macOS Terminal.app
+    2. CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID - one daemon per agent session
+    3. TERM_SESSION_ID - macOS Terminal.app
     3. VS Code/Claude Code session - extracted from VSCODE_GIT_IPC_HANDLE
     4. WINDOWID - X11 terminals (Linux)
     5. WT_SESSION - Windows Terminal
@@ -109,6 +110,16 @@ def get_session_id() -> str:
     # Explicit override
     if session_id := os.environ.get("MCPL_SESSION_ID"):
         return session_id
+
+    # Agent session ids (Claude Code, Codex). Without them, an agent whose shell has no
+    # terminal/IDE marker falls back to the parent PID - a fresh shell per Bash call - so
+    # every call got a new daemon, a new server and a new page numbering: a pageId kept
+    # from one call pointed at another agent's tab in the next (measured 29 Sep 2026:
+    # 0/18 correct reads with 3 parallel agents; 15/15 with a stable id per agent).
+    if session_id := os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return f"claude-{session_id}"
+    if session_id := os.environ.get("CODEX_THREAD_ID"):
+        return f"codex-{session_id}"
 
     # macOS Terminal.app
     if session_id := os.environ.get("TERM_SESSION_ID"):

@@ -35,6 +35,7 @@ def clear_ide_env(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_SSE_PORT", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.delenv("CODEX_CI", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
 
 class TestIsIdeEnvironment:
@@ -159,6 +160,33 @@ class TestGetIdeSessionAnchor:
 
 class TestGetSessionId:
     """Tests for get_session_id function."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_agent_session_ids(self, monkeypatch):
+        """Tests may run inside Claude Code / Codex, which export these ids."""
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+    def test_uses_claude_code_session_id(self, monkeypatch):
+        """One daemon per Claude Code session, stable across Bash calls."""
+        monkeypatch.delenv("MCPL_SESSION_ID", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "a63e1057-0f6d-486f-88c5-e5458e762c98")
+        monkeypatch.setenv("TERM_SESSION_ID", "should-not-use")
+        monkeypatch.setenv("CLAUDE_CODE_SSE_PORT", "12345")
+        assert get_session_id() == "claude-a63e1057-0f6d-486f-88c5-e5458e762c98"
+
+    def test_uses_codex_thread_id(self, monkeypatch):
+        """One daemon per Codex thread."""
+        monkeypatch.delenv("MCPL_SESSION_ID", raising=False)
+        monkeypatch.setenv("CODEX_THREAD_ID", "thread-42")
+        monkeypatch.setenv("TERM_SESSION_ID", "should-not-use")
+        assert get_session_id() == "codex-thread-42"
+
+    def test_mcpl_session_id_beats_agent_session_id(self, monkeypatch):
+        """Explicit override still wins."""
+        monkeypatch.setenv("MCPL_SESSION_ID", "custom")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc")
+        assert get_session_id() == "custom"
 
     def test_uses_mcpl_session_id_env_var(self, monkeypatch):
         """Test that MCPL_SESSION_ID takes priority."""
