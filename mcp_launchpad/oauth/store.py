@@ -7,6 +7,7 @@ This module provides secure storage for OAuth tokens using:
 - File locking to prevent race conditions
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -14,9 +15,9 @@ import logging
 import os
 import stat
 import sys
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, AsyncIterator, Callable, Generator
 
 import keyring
 from cryptography.fernet import Fernet, InvalidToken
@@ -89,6 +90,10 @@ DEFAULT_STORE_DIR = Path.home() / ".cache" / "mcp-launchpad" / "oauth"
 # File names
 TOKENS_FILE = "tokens.json"
 CLIENTS_FILE = "clients.json"
+
+# Cross-process lock serializing token refreshes and login publication
+REFRESH_LOCK_FILE = "refresh.lock"
+DEFAULT_REFRESH_LOCK_TIMEOUT = 60.0
 
 
 class TokenStoreError(Exception):
@@ -277,6 +282,71 @@ class TokenStore:
                 f"Run 'mcpl auth logout --all' to clear and re-authenticate."
             ) from e
 
+    def _read_encrypted_file_unlocked(self, filename: str) -> dict[str, Any]:
+        """Read and decrypt a JSON file; caller must already hold the file lock."""
+        filepath = self.store_dir / filename
+        if not filepath.exists():
+            return {}
+        try:
+            decrypted_json = self._decrypt(filepath.read_text())
+            result: dict[str, Any] = json.loads(decrypted_json)
+            return result
+        except TokenStoreError as e:
+            raise TokenDecryptionError(
+                f"Cannot decrypt {filename}. The encryption key may have changed. "
+                f"Run 'mcpl auth logout --all' to clear stored tokens and re-authenticate."
+            ) from e
+        except json.JSONDecodeError as e:
+            raise TokenDecryptionError(
+                f"Token file {filename} is corrupted. "
+                f"Run 'mcpl auth logout --all' to clear and re-authenticate."
+            ) from e
+
+    def _write_unlocked(self, filepath: Path, data: dict[str, Any]) -> None:
+        """Encrypt and atomically replace a file; caller must hold the lock.
+
+        Writes to a 0600 temp file in the same directory, then renames it over
+        the target, so a crash mid-write never leaves a truncated token file.
+        """
+        encrypted_data = self._encrypt(json.dumps(data, indent=2))
+        tmp_path = filepath.with_name(f".{filepath.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(encrypted_data)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        try:
+            filepath.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        except OSError as e:
+            logger.warning(f"Could not set file permissions: {e}")
+
+    def _update_encrypted_file(
+        self, filename: str, mutate: Callable[[dict[str, Any]], bool]
+    ) -> bool:
+        """Read-modify-write a file under one exclusive lock.
+
+        Holding the lock across the read and the write prevents a concurrent
+        process (another daemon, a CLI refresh) from losing an update made
+        between our read and our write.
+
+        Args:
+            filename: Name of file in store directory
+            mutate: Changes the dict in place; returns False to skip the write
+
+        Returns:
+            Whatever ``mutate`` returned
+        """
+        filepath = self.store_dir / filename
+        with _file_lock(filepath, exclusive=True):
+            data = self._read_encrypted_file_unlocked(filename)
+            changed = mutate(data)
+            if changed:
+                self._write_unlocked(filepath, data)
+            return changed
+
     def _write_encrypted_file(self, filename: str, data: dict[str, Any]) -> None:
         """Encrypt and write a JSON file with secure permissions and file locking.
 
@@ -288,16 +358,48 @@ class TokenStore:
         """
         filepath = self.store_dir / filename
 
-        json_data = json.dumps(data, indent=2)
-        encrypted_data = self._encrypt(json_data)
-
         # Write with exclusive lock and secure permissions
         with _file_lock(filepath, exclusive=True):  # Exclusive lock for writing
-            filepath.write_text(encrypted_data)
-            try:
-                filepath.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-            except OSError as e:
-                logger.warning(f"Could not set file permissions: {e}")
+            self._write_unlocked(filepath, data)
+
+    @asynccontextmanager
+    async def refresh_lock(
+        self, timeout: float = DEFAULT_REFRESH_LOCK_TIMEOUT
+    ) -> AsyncIterator[bool]:
+        """Hold the cross-process OAuth lock (polling, never blocks the loop).
+
+        Serializes token refreshes with each other and with login's final
+        publication of a token and its client, so a refresh started with an
+        old client can never write its result over a newer login.
+
+        Yields True when the lock is held, False if it could not be taken
+        within ``timeout`` seconds. Callers decide what to do without it:
+        a refresh must not redeem (fail closed); a login still publishes.
+        """
+        if sys.platform == "win32":  # pragma: no cover - no cross-process lock
+            yield True
+            return
+        lock_path = self.store_dir / REFRESH_LOCK_FILE
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        locked = False
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if loop.time() >= deadline:
+                        logger.warning(f"OAuth lock busy for {timeout}s")
+                        break
+                    await asyncio.sleep(0.1)
+            yield locked
+        finally:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _normalize_resource(self, resource: str) -> str:
         """Normalize a resource URL for consistent key lookup.
@@ -342,10 +444,12 @@ class TokenStore:
             token: The token set to store
         """
         key = self._normalize_resource(resource)
-        tokens_data = self._read_encrypted_file(TOKENS_FILE)
 
-        tokens_data[key] = token.to_dict()
-        self._write_encrypted_file(TOKENS_FILE, tokens_data)
+        def _mutate(tokens_data: dict[str, Any]) -> bool:
+            tokens_data[key] = token.to_dict()
+            return True
+
+        self._update_encrypted_file(TOKENS_FILE, _mutate)
 
         logger.debug(f"Stored token for {resource}")
 
@@ -359,16 +463,17 @@ class TokenStore:
             True if token was deleted, False if not found
         """
         key = self._normalize_resource(resource)
-        tokens_data = self._read_encrypted_file(TOKENS_FILE)
 
-        if key not in tokens_data:
-            return False
+        def _mutate(tokens_data: dict[str, Any]) -> bool:
+            if key not in tokens_data:
+                return False
+            del tokens_data[key]
+            return True
 
-        del tokens_data[key]
-        self._write_encrypted_file(TOKENS_FILE, tokens_data)
-
-        logger.debug(f"Deleted token for {resource}")
-        return True
+        deleted = self._update_encrypted_file(TOKENS_FILE, _mutate)
+        if deleted:
+            logger.debug(f"Deleted token for {resource}")
+        return deleted
 
     def list_resources(self) -> list[str]:
         """List all resources with stored tokens.
@@ -437,12 +542,127 @@ class TokenStore:
             client: The client credentials to store
         """
         key = self._normalize_resource(auth_server)
-        clients_data = self._read_encrypted_file(CLIENTS_FILE)
 
-        clients_data[key] = client.to_dict()
-        self._write_encrypted_file(CLIENTS_FILE, clients_data)
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            clients_data[key] = client.to_dict()
+            return True
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
 
         logger.debug(f"Stored client credentials for {auth_server}")
+
+    # Clients are historically keyed by authorization server (issuer) only.
+    # Two MCP servers on one issuer can use different clients (one DCR, one
+    # configured), so the client that obtained a token is also stored under
+    # its resource. Older mcpl versions only read issuer keys and ignore
+    # these extra "resource:" entries.
+    _RESOURCE_CLIENT_PREFIX = "resource:"
+
+    def get_client_for_resource(self, resource: str) -> ClientCredentials | None:
+        """Get the client that obtained the token for a resource, if recorded."""
+        return self.get_client(self._RESOURCE_CLIENT_PREFIX + resource)
+
+    def get_issuer_for_resource_client(self, resource: str) -> str | None:
+        """Issuer recorded with a resource's client (None if unknown/legacy)."""
+        key = self._normalize_resource(self._RESOURCE_CLIENT_PREFIX + resource)
+        entry = self._read_encrypted_file(CLIENTS_FILE).get(key)
+        issuer = entry.get("issuer") if isinstance(entry, dict) else None
+        return issuer if isinstance(issuer, str) else None
+
+    def set_client_for_resource(
+        self, resource: str, client: ClientCredentials, issuer: str | None = None
+    ) -> None:
+        """Record the client that obtained the token for a resource.
+
+        ``issuer`` scopes the record: client ids are unique only within one
+        authorization server, so secret updates must not cross issuers.
+        """
+        key = self._normalize_resource(self._RESOURCE_CLIENT_PREFIX + resource)
+        entry = client.to_dict()
+        if issuer:
+            entry["issuer"] = self._normalize_resource(issuer)
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            clients_data[key] = entry
+            return True
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
+
+    def delete_client_for_resource(self, resource: str) -> bool:
+        """Forget the client recorded for a resource."""
+        return self.delete_client(self._RESOURCE_CLIENT_PREFIX + resource)
+
+    def propagate_client_secret(
+        self, issuer: str, client_id: str, client_secret: str
+    ) -> int:
+        """Set a new secret on every record of one client of one issuer.
+
+        The same client can be recorded under its issuer and under several
+        resources; a rotated secret must reach all of them, or a stale record
+        keeps being selected. Scope is (issuer, client_id): client ids are
+        unique only within an authorization server, so records of another
+        issuer - or resource records whose issuer is unknown - are never
+        touched.
+
+        Returns:
+            Number of records changed
+        """
+        if not client_secret:
+            return 0
+        issuer_key = self._normalize_resource(issuer)
+        changed = 0
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            nonlocal changed
+            for key, entry in clients_data.items():
+                if not isinstance(entry, dict) or entry.get("client_id") != client_id:
+                    continue
+                if key.startswith(self._RESOURCE_CLIENT_PREFIX):
+                    same_issuer = entry.get("issuer") == issuer_key
+                else:
+                    same_issuer = key == issuer_key
+                if same_issuer and entry.get("client_secret") != client_secret:
+                    entry["client_secret"] = client_secret
+                    changed += 1
+            return changed > 0
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
+        return changed
+
+    def set_client_if_compatible(
+        self,
+        auth_server: str,
+        client: ClientCredentials,
+        replace_same_id: bool = False,
+    ) -> bool:
+        """Store an issuer client only if it cannot clobber another client.
+
+        Checked and written under one lock, so a concurrent process storing a
+        different client for the same issuer is never overwritten.
+
+        Args:
+            auth_server: The authorization server URL
+            client: The client credentials to store
+            replace_same_id: Also replace an entry with the same client_id
+                (e.g. a new secret at login); a different client_id is never
+                replaced
+
+        Returns:
+            True if written
+        """
+        key = self._normalize_resource(auth_server)
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            existing = clients_data.get(key)
+            if existing is None:
+                clients_data[key] = client.to_dict()
+                return True
+            if replace_same_id and existing.get("client_id") == client.client_id:
+                clients_data[key] = client.to_dict()
+                return True
+            return False
+
+        return self._update_encrypted_file(CLIENTS_FILE, _mutate)
 
     def delete_client(self, auth_server: str) -> bool:
         """Delete client credentials for an authorization server.
@@ -454,16 +674,17 @@ class TokenStore:
             True if deleted, False if not found
         """
         key = self._normalize_resource(auth_server)
-        clients_data = self._read_encrypted_file(CLIENTS_FILE)
 
-        if key not in clients_data:
-            return False
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            if key not in clients_data:
+                return False
+            del clients_data[key]
+            return True
 
-        del clients_data[key]
-        self._write_encrypted_file(CLIENTS_FILE, clients_data)
-
-        logger.debug(f"Deleted client credentials for {auth_server}")
-        return True
+        deleted = self._update_encrypted_file(CLIENTS_FILE, _mutate)
+        if deleted:
+            logger.debug(f"Deleted client credentials for {auth_server}")
+        return deleted
 
     # Utility methods
 

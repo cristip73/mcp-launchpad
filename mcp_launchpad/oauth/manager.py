@@ -5,7 +5,10 @@ both the CLI and daemon to manage authentication for MCP servers.
 """
 
 import logging
+import os
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -13,10 +16,19 @@ from urllib.parse import urlparse
 
 from .discovery import DiscoveryError, OAuthConfig, discover_oauth_config
 from .flow import OAuthFlow, OAuthFlowError, TokenExchangeError, refresh_token, revoke_token
+from .store import REFRESH_LOCK_FILE as STORE_REFRESH_LOCK_FILE
 from .store import TokenDecryptionError, TokenStore
-from .tokens import TokenSet
+from .tokens import ClientCredentials, TokenSet
 
 logger = logging.getLogger(__name__)
+
+# Refresh this many seconds before the access token expires, so a request
+# never leaves with a token that dies in flight.
+REFRESH_BUFFER_SECONDS = int(os.environ.get("MCPL_OAUTH_REFRESH_BUFFER", "60"))
+
+# Cross-process lock serializing token refreshes (lives in the store dir)
+REFRESH_LOCK_FILE = STORE_REFRESH_LOCK_FILE
+REFRESH_LOCK_TIMEOUT = 60
 
 
 def _format_timedelta(td: timedelta) -> str:
@@ -398,170 +410,313 @@ class OAuthManager:
 
         return token
 
-    async def refresh_if_needed(self, server_url: str) -> bool:
-        """Refresh the token if it's expired.
+    # ------------------------------------------------------------------
+    # Token refresh
+    #
+    # Several processes share one token store (one daemon per agent session,
+    # plus CLI commands such as `mcpl auth refresh`). Short-lived tokens
+    # (e.g. 10 minutes) and rotating refresh tokens make uncoordinated
+    # refreshes dangerous: two processes redeeming the same refresh token can
+    # leave one of them with an invalid_grant. Every refresh therefore runs
+    # under a cross-process lock and re-reads the store inside it, so a
+    # process that waited simply picks up the token the other one wrote.
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def _refresh_lock(self) -> AsyncIterator[bool]:
+        """The store's cross-process OAuth lock (see TokenStore.refresh_lock).
+
+        Yields False after REFRESH_LOCK_TIMEOUT seconds; refresh callers must
+        then NOT redeem the refresh token (fail closed: another process is
+        mid-refresh and a second redemption could invalidate a rotating one).
+        """
+        async with self._store.refresh_lock(timeout=REFRESH_LOCK_TIMEOUT) as locked:
+            yield locked
+
+    @staticmethod
+    def _needs_refresh(
+        token: TokenSet, rejected_access_token: str | None
+    ) -> bool:
+        """A token needs refreshing if it is (nearly) expired or was rejected."""
+        if token.is_expired(buffer_seconds=REFRESH_BUFFER_SECONDS):
+            return True
+        return (
+            rejected_access_token is not None
+            and token.access_token == rejected_access_token
+        )
+
+    async def _get_oauth_config(self, server_url: str) -> OAuthConfig | None:
+        oauth_config = self._oauth_configs.get(server_url)
+        if oauth_config is not None:
+            return oauth_config
+        try:
+            logger.debug(f"Discovering OAuth config for {server_url} to refresh token")
+            oauth_config = await discover_oauth_config(server_url)
+        except DiscoveryError as e:
+            logger.warning(f"OAuth discovery failed during token refresh: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error during OAuth discovery for refresh: {e}")
+            return None
+        self._oauth_configs[server_url] = oauth_config
+        return oauth_config
+
+    def _client_records(
+        self, auth_server: str, resource: str
+    ) -> tuple[ClientCredentials | None, ClientCredentials | None]:
+        """(resource record, issuer record) for a resource on one issuer.
+
+        A resource record known to belong to a different issuer is ignored:
+        client ids and secrets never cross authorization servers.
+        """
+        by_resource = self._store.get_client_for_resource(resource)
+        if by_resource is not None:
+            recorded = self._store.get_issuer_for_resource_client(resource)
+            if recorded is not None and recorded != auth_server.rstrip("/").lower():
+                by_resource = None
+        by_issuer = self._store.get_client(auth_server)
+        return by_resource, by_issuer
+
+    def _lookup_client(self, auth_server: str, resource: str) -> ClientCredentials | None:
+        """Client for a resource without config: resource record, then issuer.
+
+        If the chosen record has no secret but the other record (same issuer)
+        has the same client_id with a secret, that secret is used.
+        """
+        by_resource, by_issuer = self._client_records(auth_server, resource)
+        chosen = by_resource or by_issuer
+        if chosen is None or chosen.client_secret:
+            return chosen
+        for other in (by_resource, by_issuer):
+            if other is not None and other.client_id == chosen.client_id and other.client_secret:
+                return ClientCredentials(chosen.client_id, other.client_secret, chosen.redirect_uri)
+        return chosen
+
+    def _select_client(
+        self,
+        auth_server: str,
+        resource: str,
+        client_id: str | None,
+        client_secret: str | None,
+    ) -> ClientCredentials | None:
+        """Pick the client credentials to redeem this resource's refresh token.
+
+        Caller holds the refresh lock. Order: the server's configured client
+        id (authoritative), then the client recorded for this resource at
+        login, then the issuer client. A stored secret is reused only for the
+        same client_id; an explicit (configured) secret is propagated to every
+        stored record of that client_id.
+        """
+        by_resource, by_issuer = self._client_records(auth_server, resource)
+        if (
+            by_resource is not None
+            and self._store.get_issuer_for_resource_client(resource) is None
+        ):
+            # Record written without its issuer (earlier build): we know it now,
+            # and scoped secret propagation (here or at a later login) needs it.
+            # Done before the unconfigured early return too (Codex r5 minor).
+            try:
+                self._store.set_client_for_resource(resource, by_resource, issuer=auth_server)
+            except Exception as e:  # pragma: no cover - best effort
+                logger.debug(f"Could not record issuer for {resource}: {e}")
+
+        if not client_id:
+            return self._lookup_client(auth_server, resource)
+
+        same_id = [
+            c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id
+        ]
+        secret = client_secret or next(
+            (c.client_secret for c in same_id if c.client_secret), None
+        )
+        client = ClientCredentials(client_id, secret)
+        try:
+            if client_secret:
+                self._store.propagate_client_secret(auth_server, client_id, client_secret)
+            # Fill only empty slots: never clobber another server's client
+            if by_resource is None:
+                self._store.set_client_for_resource(resource, client, issuer=auth_server)
+            self._store.set_client_if_compatible(auth_server, client)
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug(f"Could not persist configured client for {auth_server}: {e}")
+        return client
+
+    async def _do_refresh(
+        self,
+        server_url: str,
+        token: TokenSet,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> TokenSet | None:
+        """Redeem the refresh token and store the result. Caller holds the lock.
 
         Args:
             server_url: The MCP server URL
+            token: The current stored token (must have a refresh token)
+            client_id: Configured client id, used when the store has no client
+                for this authorization server (servers without DCR)
+            client_secret: Configured client secret, if any
 
         Returns:
-            True if token was refreshed or is still valid,
-            False if refresh failed or no token exists
+            The new TokenSet, or None if the refresh failed
         """
-        token = self._lookup_token(server_url)
-        if token is None:
-            logger.debug(f"No token stored for {server_url}, cannot refresh")
-            return False
-
-        # Token is still valid
-        if not token.is_expired():
-            logger.debug(f"Token for {server_url} is still valid, no refresh needed")
-            return True
-
-        # Token is expired - log details
-        expires_info = f" (expired at {token.expires_at})" if token.expires_at else ""
-        logger.info(f"Token for {server_url} has expired{expires_info}, attempting refresh")
-
-        # No refresh token available
-        if not token.has_refresh_token():
-            logger.info(
-                f"Token for {server_url} expired but no refresh token available. "
-                f"User must re-authenticate."
-            )
-            return False
-
-        # Get OAuth config (may need to discover)
-        oauth_config = self._oauth_configs.get(server_url)
+        oauth_config = await self._get_oauth_config(server_url)
         if oauth_config is None:
-            try:
-                logger.debug(f"Discovering OAuth config for {server_url} to refresh token")
-                oauth_config = await discover_oauth_config(server_url)
-                self._oauth_configs[server_url] = oauth_config
-            except DiscoveryError as e:
-                logger.warning(f"OAuth discovery failed during token refresh: {e}")
-                return False
-            except Exception as e:
-                logger.warning(f"Unexpected error during OAuth discovery for refresh: {e}")
-                return False
+            return None
 
-        # Get client credentials
         auth_server = oauth_config.auth_server_metadata.issuer
-        client = self._store.get_client(auth_server)
+        client = self._select_client(
+            auth_server,
+            oauth_config.resource_uri or server_url,
+            client_id,
+            client_secret,
+        )
         if client is None:
-            logger.warning(f"No client credentials for {auth_server}")
-            return False
+            logger.warning(
+                f"No client credentials for {auth_server}. Set oauth_client_id "
+                f"in the server config or run: mcpl auth login --force"
+            )
+            return None
 
-        # Attempt refresh
         try:
             token_response = await refresh_token(
                 oauth_config.auth_server_metadata,
                 client,
-                token.refresh_token,  # type: ignore
+                token.refresh_token,  # type: ignore[arg-type]
                 oauth_config.resource_uri,
             )
-
-            new_token = TokenSet.from_token_response(
-                token_response,
-                oauth_config.resource_uri,
-            )
-
-            # Preserve refresh_token if server didn't return a new one
-            # (many OAuth servers only return access_token on refresh)
-            if not new_token.has_refresh_token() and token.has_refresh_token():
-                new_token.refresh_token = token.refresh_token
-                logger.debug(
-                    f"Preserved existing refresh_token for {server_url} "
-                    f"(server didn't return new one)"
-                )
-
-            # Save under resource_uri (canonical key), not server_url
-            # to avoid duplicate entries in token store
-            store_key = oauth_config.resource_uri or server_url
-            self._store.set_token(store_key, new_token)
-            logger.info(f"Token refreshed for {store_key}")
-            return True
-
         except TokenExchangeError as e:
-            error_str = str(e)
-            if "invalid_grant" in error_str:
+            if "invalid_grant" in str(e):
                 logger.warning(
                     f"Refresh token revoked/expired for {server_url}: {e}. "
                     f"User must re-authenticate with: mcpl auth login"
                 )
             else:
                 logger.warning(f"Token refresh failed for {server_url}: {e}")
-            return False
+            return None
 
-    async def refresh_proactively(self, server_url: str) -> bool:
-        """Refresh the token proactively, even if not yet expired.
+        new_token = TokenSet.from_token_response(
+            token_response,
+            oauth_config.resource_uri,
+        )
 
-        Used by the daemon's periodic refresh task to renew tokens
-        before they expire, preventing mid-session auth failures.
+        # Preserve refresh_token if server didn't return a new one
+        # (many OAuth servers only return access_token on refresh)
+        if not new_token.has_refresh_token() and token.has_refresh_token():
+            new_token.refresh_token = token.refresh_token
+
+        # Save under resource_uri (canonical key), not server_url
+        # to avoid duplicate entries in token store
+        store_key = oauth_config.resource_uri or server_url
+        self._store.set_token(store_key, new_token)
+        logger.info(f"Token refreshed for {store_key}")
+        return new_token
+
+    async def get_fresh_token(
+        self,
+        server_url: str,
+        rejected_access_token: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> TokenSet | None:
+        """Return the best token for a request, refreshing it when needed.
+
+        Always reads the shared store, so a token refreshed by another process
+        is picked up without a refresh of our own.
 
         Args:
             server_url: The MCP server URL
+            rejected_access_token: An access token the server just answered
+                with 401; forces a refresh unless the store already holds a
+                different token
+            client_id: Configured client id (fallback when the store has none)
+            client_secret: Configured client secret
 
         Returns:
-            True if token was refreshed, False if refresh failed
+            The stored (possibly refreshed) token, or None if none is stored.
+            If a needed refresh fails, the current token is returned as is.
         """
         token = self._lookup_token(server_url)
-        if token is None:
-            return False
+        if token is None or not self._needs_refresh(token, rejected_access_token):
+            return token
         if not token.has_refresh_token():
+            return token
+
+        async with self._refresh_lock() as locked:
+            # Re-read under the lock: another process may have refreshed already
+            token = self._lookup_token(server_url)
+            if token is None or not self._needs_refresh(token, rejected_access_token):
+                return token
+            if not token.has_refresh_token() or not locked:
+                return token
+            new_token = await self._do_refresh(
+                server_url, token, client_id=client_id, client_secret=client_secret
+            )
+            return new_token or token
+
+    async def refresh_if_needed(
+        self,
+        server_url: str,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> bool:
+        """Refresh the token if it's expired.
+
+        Args:
+            server_url: The MCP server URL
+            client_id: Configured client id (fallback when the store has none)
+            client_secret: Configured client secret
+
+        Returns:
+            True if token was refreshed or is still valid,
+            False if refresh failed or no token exists
+        """
+        token = await self.get_fresh_token(
+            server_url, client_id=client_id, client_secret=client_secret
+        )
+        if token is None:
+            logger.debug(f"No token stored for {server_url}, cannot refresh")
+            return False
+        return not token.is_expired()
+
+    async def refresh_proactively(
+        self,
+        server_url: str,
+        min_remaining_seconds: int | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> bool:
+        """Refresh the token proactively, even if not yet expired.
+
+        Used by the daemon's periodic refresh task and by `mcpl auth refresh`.
+
+        Args:
+            server_url: The MCP server URL
+            min_remaining_seconds: If set, skip the refresh when (after waiting
+                for the lock) the stored token still has at least this much
+                lifetime left - another process refreshed it meanwhile
+            client_id: Configured client id (fallback when the store has none)
+            client_secret: Configured client secret
+
+        Returns:
+            True if token was refreshed (or found fresh), False if refresh failed
+        """
+        token = self._lookup_token(server_url)
+        if token is None or not token.has_refresh_token():
             return False
 
-        oauth_config = self._oauth_configs.get(server_url)
-        if oauth_config is None:
-            try:
-                oauth_config = await discover_oauth_config(server_url)
-                self._oauth_configs[server_url] = oauth_config
-            except (DiscoveryError, Exception) as e:
-                logger.warning(f"OAuth discovery failed for proactive refresh: {e}")
+        async with self._refresh_lock() as locked:
+            token = self._lookup_token(server_url)
+            if token is None or not token.has_refresh_token() or not locked:
                 return False
-
-        auth_server = oauth_config.auth_server_metadata.issuer
-        client = self._store.get_client(auth_server)
-        if client is None:
-            logger.warning(f"No client credentials for {auth_server}")
-            return False
-
-        try:
-            token_response = await refresh_token(
-                oauth_config.auth_server_metadata,
-                client,
-                token.refresh_token,  # type: ignore
-                oauth_config.resource_uri,
+            if min_remaining_seconds is not None and not token.is_expired(
+                buffer_seconds=min_remaining_seconds
+            ):
+                return True
+            new_token = await self._do_refresh(
+                server_url, token, client_id=client_id, client_secret=client_secret
             )
-            new_token = TokenSet.from_token_response(
-                token_response,
-                oauth_config.resource_uri,
-            )
-
-            # Preserve refresh_token if server didn't return a new one
-            if not new_token.has_refresh_token() and token.has_refresh_token():
-                new_token.refresh_token = token.refresh_token
-                logger.debug(
-                    f"Preserved existing refresh_token for {server_url} "
-                    f"(server didn't return new one on proactive refresh)"
-                )
-
-            # Save under resource_uri (canonical key), not server_url
-            store_key = oauth_config.resource_uri or server_url
-            self._store.set_token(store_key, new_token)
-            logger.info(f"Token proactively refreshed for {store_key}")
-            return True
-        except TokenExchangeError as e:
-            error_str = str(e)
-            if "invalid_grant" in error_str:
-                logger.warning(
-                    f"Refresh token revoked/expired for {server_url}: {e}. "
-                    f"User must re-authenticate with: mcpl auth login"
-                )
-            else:
-                logger.warning(
-                    f"Proactive token refresh failed for {server_url}: {e}"
-                )
-            return False
+            return new_token is not None
 
     def logout(self, server_url: str) -> bool:
         """Remove stored authentication for a server (sync version).
@@ -611,7 +766,10 @@ class OAuthManager:
         # Attempt server-side revocation if we have config
         if oauth_config and oauth_config.auth_server_metadata.supports_revocation():
             auth_server = oauth_config.auth_server_metadata.issuer
-            client = self._store.get_client(auth_server)
+            # Same selection as refresh: the client that obtained this token
+            client = self._lookup_client(
+                auth_server, oauth_config.resource_uri or token.resource
+            )
 
             if client:
                 # Revoke access token
@@ -631,8 +789,14 @@ class OAuthManager:
                         token_type_hint="refresh_token",
                     )
 
-        # Always delete local token
+        # Always delete local token (and the client recorded for it)
         deleted = self._store.delete_token(server_url)
+        try:
+            resource = (oauth_config.resource_uri if oauth_config else None) or token.resource
+            if resource:
+                self._store.delete_client_for_resource(resource)
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug(f"Could not forget resource client for {server_url}: {e}")
         if deleted:
             logger.info(f"Logged out from {server_url}")
         return deleted
