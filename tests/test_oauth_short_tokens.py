@@ -1,0 +1,545 @@
+"""Short-lived OAuth tokens: per-request auth, locked refresh, error bodies.
+
+Covers the three defects seen with the Storyblocks MCP server (10-minute
+access tokens, no DCR, errors sent with an HTTP error status):
+
+1. a long-lived session kept sending the token it connected with;
+2. a configured (non-DCR) client was not stored at login, so refresh failed;
+3. the server's error text was replaced by "Server returned an error response".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import os
+import stat
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
+from mcp_launchpad.http_client import ErrorBodyTransport, OAuthBearerAuth, build_http_client
+from mcp_launchpad.oauth import manager as manager_module
+from mcp_launchpad.oauth.flow import OAuthFlow
+from mcp_launchpad.oauth.manager import OAuthManager
+from mcp_launchpad.oauth.store import TokenStore
+from mcp_launchpad.oauth.tokens import ClientCredentials, TokenSet
+
+SERVER_URL = "https://mcp.example.com/mcp"
+ISSUER = "https://auth.example.com"
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> TokenStore:
+    # Fallback (machine-derived) key: never touch the real OS keychain in tests
+    with patch(
+        "mcp_launchpad.oauth.store.keyring.get_password",
+        side_effect=Exception("no keyring in tests"),
+    ):
+        return TokenStore(store_dir=tmp_path / "oauth")
+
+
+def _token(access: str, expires_in: int, refresh: str | None = "rt-1") -> TokenSet:
+    now = datetime.now(timezone.utc)
+    return TokenSet(
+        access_token=access,
+        token_type="Bearer",
+        resource=SERVER_URL,
+        refresh_token=refresh,
+        expires_at=now + timedelta(seconds=expires_in),
+        issued_at=now,
+    )
+
+
+def _oauth_config() -> MagicMock:
+    cfg = MagicMock()
+    cfg.auth_server_metadata.issuer = ISSUER
+    cfg.resource_uri = SERVER_URL
+    return cfg
+
+
+@pytest.fixture
+def manager(store: TokenStore) -> OAuthManager:
+    m = OAuthManager(_store=store)
+    m._oauth_configs[SERVER_URL] = _oauth_config()
+    return m
+
+
+def _refresh_mock(*access_tokens: str, delay: float = 0.0) -> AsyncMock:
+    """A refresh_token() stand-in that hands out the given tokens in order."""
+    queue = list(access_tokens)
+
+    async def _refresh(metadata: Any, client: Any, rt: str, resource: str) -> dict[str, Any]:
+        if delay:
+            await asyncio.sleep(delay)
+        return {"access_token": queue.pop(0), "expires_in": 600, "refresh_token": "rt-2"}
+
+    return AsyncMock(side_effect=_refresh)
+
+
+# ---------------------------------------------------------------------------
+# Token store: read-modify-write under one lock, atomic 0600 files
+# ---------------------------------------------------------------------------
+
+
+class TestStoreWrites:
+    def test_set_token_keeps_other_entries_and_0600(self, store: TokenStore) -> None:
+        store.set_token("https://a.example.com", _token("a", 600))
+        store.set_token("https://b.example.com", _token("b", 600))
+        assert store.get_token("https://a.example.com").access_token == "a"
+        assert store.get_token("https://b.example.com").access_token == "b"
+        mode = stat.S_IMODE((store.store_dir / "tokens.json").stat().st_mode)
+        assert mode == 0o600
+        # No temp files left behind
+        assert not [p for p in store.store_dir.iterdir() if p.name.endswith(".tmp")]
+
+    def test_delete_missing_returns_false(self, store: TokenStore) -> None:
+        assert store.delete_token("https://nope.example.com") is False
+        assert store.delete_client("https://nope.example.com") is False
+
+
+# ---------------------------------------------------------------------------
+# Defect 2: configured client must be stored / usable for refresh
+# ---------------------------------------------------------------------------
+
+
+class TestConfiguredClient:
+    @pytest.mark.asyncio
+    async def test_login_with_configured_client_stores_it(self, store: TokenStore) -> None:
+        flow = OAuthFlow(
+            server_url=SERVER_URL,
+            token_store=store,
+            client_id="https://client.example.com/metadata.json",
+            callback_port=47391,
+        )
+        callback = MagicMock()
+        callback.redirect_uri = "http://localhost:47391/callback"
+        callback.wait_for_callback = AsyncMock(
+            return_value=MagicMock(
+                is_success=lambda: True, state="fixed-state", code="the-code"
+            )
+        )
+        cb_cm = MagicMock()
+        cb_cm.__aenter__ = AsyncMock(return_value=callback)
+        cb_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch.object(OAuthFlow, "discover", AsyncMock(return_value=_oauth_config())),
+            patch("mcp_launchpad.oauth.flow.LocalhostCallbackServer", return_value=cb_cm),
+            patch("mcp_launchpad.oauth.flow.build_authorization_url", return_value="https://x"),
+            patch("mcp_launchpad.oauth.flow.generate_state", return_value="fixed-state"),
+            patch("mcp_launchpad.oauth.flow.webbrowser.open", return_value=True),
+            patch(
+                "mcp_launchpad.oauth.flow.exchange_code_for_tokens",
+                AsyncMock(return_value={"access_token": "at", "expires_in": 600, "refresh_token": "rt"}),
+            ),
+        ):
+            await flow.run()
+
+        client = store.get_client(ISSUER)
+        assert client is not None
+        assert client.client_id == "https://client.example.com/metadata.json"
+        assert client.redirect_uri == "http://localhost:47391/callback"
+
+    @pytest.mark.asyncio
+    async def test_refresh_falls_back_to_configured_client(
+        self, store: TokenStore, manager: OAuthManager
+    ) -> None:
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            # Without a client anywhere, refresh cannot happen
+            assert await manager.refresh_if_needed(SERVER_URL) is False
+            refresh.assert_not_called()
+            # With the configured client id it works, and the client is persisted
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="cid") is True
+        assert refresh.await_count == 1
+        assert refresh.await_args.args[1].client_id == "cid"
+        assert store.get_token(SERVER_URL).access_token == "new"
+        assert store.get_client(ISSUER).client_id == "cid"
+
+
+# ---------------------------------------------------------------------------
+# Defect 1: refresh before expiry, on 401, and pick up other processes' tokens
+# ---------------------------------------------------------------------------
+
+
+class TestFreshToken:
+    @pytest.mark.asyncio
+    async def test_valid_token_is_not_refreshed(self, store, manager) -> None:
+        store.set_token(SERVER_URL, _token("live", 600))
+        refresh = _refresh_mock("x")
+        with patch.object(manager_module, "refresh_token", refresh):
+            token = await manager.get_fresh_token(SERVER_URL)
+        assert token.access_token == "live"
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nearly_expired_token_is_refreshed(self, store, manager) -> None:
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old", 20))  # inside the 60 s buffer
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            token = await manager.get_fresh_token(SERVER_URL)
+        assert token.access_token == "new"
+        assert store.get_token(SERVER_URL).refresh_token == "rt-2"
+
+    @pytest.mark.asyncio
+    async def test_rejected_token_forces_refresh(self, store, manager) -> None:
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("revoked", 600))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            token = await manager.get_fresh_token(SERVER_URL, rejected_access_token="revoked")
+        assert token.access_token == "new"
+
+    @pytest.mark.asyncio
+    async def test_rejected_token_but_store_already_newer(self, store, manager) -> None:
+        """Another process refreshed: use its token, do not redeem again."""
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("from-other-process", 600))
+        refresh = _refresh_mock("x")
+        with patch.object(manager_module, "refresh_token", refresh):
+            token = await manager.get_fresh_token(SERVER_URL, rejected_access_token="mine-old")
+        assert token.access_token == "from-other-process"
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_refreshes_redeem_once(self, store, manager) -> None:
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new-1", "new-2", "new-3", delay=0.2)
+        with patch.object(manager_module, "refresh_token", refresh):
+            tokens = await asyncio.gather(
+                *(manager.get_fresh_token(SERVER_URL) for _ in range(3))
+            )
+        assert refresh.await_count == 1
+        assert {t.access_token for t in tokens} == {"new-1"}
+
+    @pytest.mark.asyncio
+    async def test_waits_for_lock_held_by_other_process_then_rereads(
+        self, store, manager
+    ) -> None:
+        """Simulates another process mid-refresh holding the refresh lock."""
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        lock_path = store.store_dir / manager_module.REFRESH_LOCK_FILE
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # separate fd = separate lock owner
+        refresh = _refresh_mock("mine")
+        try:
+            with patch.object(manager_module, "refresh_token", refresh):
+                task = asyncio.create_task(manager.get_fresh_token(SERVER_URL))
+                await asyncio.sleep(0.3)
+                assert not task.done()  # blocked on the lock
+                # The "other process" finishes its refresh and releases the lock
+                store.set_token(SERVER_URL, _token("theirs", 600))
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                token = await asyncio.wait_for(task, 5)
+        finally:
+            os.close(fd)
+        assert token.access_token == "theirs"
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_returns_current_token(self, store, manager) -> None:
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        from mcp_launchpad.oauth.flow import TokenExchangeError
+
+        with patch.object(
+            manager_module, "refresh_token", AsyncMock(side_effect=TokenExchangeError("invalid_grant"))
+        ):
+            token = await manager.get_fresh_token(SERVER_URL)
+            assert await manager.refresh_if_needed(SERVER_URL) is False
+        assert token.access_token == "old"
+
+    @pytest.mark.asyncio
+    async def test_proactive_refresh_skips_when_other_process_refreshed(
+        self, store, manager
+    ) -> None:
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("fresh", 3000))
+        refresh = _refresh_mock("x")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_proactively(SERVER_URL, min_remaining_seconds=600)
+            refresh.assert_not_called()
+            # Forced (CLI `mcpl auth refresh`) always redeems
+            assert await manager.refresh_proactively(SERVER_URL)
+        assert refresh.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# OAuthBearerAuth: header per request, one retry on 401
+# ---------------------------------------------------------------------------
+
+
+class TestBearerAuth:
+    @pytest.mark.asyncio
+    async def test_header_follows_the_store(self, store, manager) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get("Authorization", ""))
+            return httpx.Response(200, json={})
+
+        store.set_token(SERVER_URL, _token("first", 600))
+        auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+        async with httpx.AsyncClient(auth=auth, transport=httpx.MockTransport(handler)) as c:
+            await c.post(SERVER_URL, json={})
+            store.set_token(SERVER_URL, _token("second", 600))  # e.g. `mcpl auth refresh` elsewhere
+            await c.post(SERVER_URL, json={})
+        assert seen == ["Bearer first", "Bearer second"]
+
+    @pytest.mark.asyncio
+    async def test_401_refreshes_and_retries_once(self, store, manager) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            auth = request.headers.get("Authorization", "")
+            seen.append(auth)
+            if auth == "Bearer new":
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(401, json={"error": "invalid_token"})
+
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("dead", 600))  # not expired by clock
+        with patch.object(manager_module, "refresh_token", _refresh_mock("new")):
+            auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+            async with httpx.AsyncClient(auth=auth, transport=httpx.MockTransport(handler)) as c:
+                r = await c.post(SERVER_URL, json={})
+        assert r.status_code == 200
+        assert seen == ["Bearer dead", "Bearer new"]
+
+    @pytest.mark.asyncio
+    async def test_401_without_new_token_is_returned(self, store, manager) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(401, json={"error": "invalid_token"})
+
+        store.set_token(SERVER_URL, _token("dead", 600, refresh=None))
+        auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+        async with httpx.AsyncClient(auth=auth, transport=httpx.MockTransport(handler)) as c:
+            r = await c.post(SERVER_URL, json={})
+        assert r.status_code == 401
+        assert calls == 1  # no retry loop
+
+    def test_static_api_key_skips_oauth(self) -> None:
+        client = build_http_client("s", SERVER_URL, {}, "key", httpx.Timeout(5))
+        assert client.auth is None or not isinstance(client.auth, OAuthBearerAuth)
+        assert client.headers["Authorization"] == "Bearer key"
+
+    def test_explicit_header_skips_oauth(self) -> None:
+        client = build_http_client("s", SERVER_URL, {"Authorization": "Token x"}, None, httpx.Timeout(5))
+        assert not isinstance(client.auth, OAuthBearerAuth)
+
+    def test_oauth_when_no_key(self) -> None:
+        client = build_http_client("s", SERVER_URL, {}, None, httpx.Timeout(5), client_id="cid")
+        assert isinstance(client.auth, OAuthBearerAuth)
+        assert client.auth.client_id == "cid"
+        assert "Authorization" not in client.headers
+
+
+# ---------------------------------------------------------------------------
+# Defect 3: keep the server's error text
+# ---------------------------------------------------------------------------
+
+
+def _rpc(method: str = "tools/call", rid: Any = 7) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rid, "method": method, "params": {}}
+
+
+async def _send(handler, payload: Any, method: str = "POST", headers=None) -> httpx.Response:
+    transport = ErrorBodyTransport(httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=transport, headers=headers or {}) as c:
+        if method == "POST":
+            return await c.post(SERVER_URL, json=payload)
+        return await c.get(SERVER_URL)
+
+
+class TestErrorBodyTransport:
+    @pytest.mark.asyncio
+    async def test_text_error_becomes_jsonrpc_error(self) -> None:
+        def handler(request):
+            return httpx.Response(403, text="[not_entitled] This item isn't included on your current plan.")
+
+        r = await _send(handler, _rpc())
+        assert r.status_code == 403
+        body = r.json()
+        assert body["id"] == 7
+        assert "HTTP 403" in body["error"]["message"]
+        assert "not_entitled" in body["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_jsonrpc_result_with_error_status_passes_as_200(self) -> None:
+        result = {"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": "nope"}], "isError": True}}
+
+        def handler(request):
+            return httpx.Response(400, json=result)
+
+        r = await _send(handler, _rpc())
+        assert r.status_code == 200
+        assert r.json() == result
+
+    @pytest.mark.asyncio
+    async def test_sse_result_with_error_status_passes_as_200(self) -> None:
+        result = {"jsonrpc": "2.0", "id": 7, "result": {"content": [], "isError": True}}
+
+        def handler(request):
+            return httpx.Response(
+                403,
+                headers={"content-type": "text/event-stream"},
+                text=f"event: message\ndata: {json.dumps(result)}\n\n",
+            )
+
+        r = await _send(handler, _rpc())
+        assert r.status_code == 200
+        assert r.json() == result
+
+    @pytest.mark.asyncio
+    async def test_401_keeps_status_and_www_authenticate(self) -> None:
+        def handler(request):
+            return httpx.Response(
+                401,
+                headers={"WWW-Authenticate": 'Bearer resource_metadata="x"'},
+                json={"error": "invalid_token", "error_description": "Invalid or expired token"},
+            )
+
+        r = await _send(handler, _rpc("initialize", 0))
+        assert r.status_code == 401
+        assert r.headers["WWW-Authenticate"] == 'Bearer resource_metadata="x"'
+        assert "Invalid or expired token" in r.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_bearer_token_is_redacted(self) -> None:
+        def handler(request):
+            return httpx.Response(500, text="bad token secret-abc in request")
+
+        r = await _send(handler, _rpc(), headers={"Authorization": "Bearer secret-abc"})
+        assert "secret-abc" not in r.text
+        assert "[redacted]" in r.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_untouched_cases(self) -> None:
+        def handler(request):
+            return httpx.Response(404 if request.method == "POST" else 405, text="raw")
+
+        # 404 keeps its SDK meaning
+        assert (await _send(handler, _rpc())).text == "raw"
+        # GET (SSE listen stream) untouched
+        assert (await _send(handler, None, method="GET")).text == "raw"
+
+        def handler2(request):
+            return httpx.Response(500, text="raw")
+
+        # notifications (no id) untouched
+        assert (await _send(handler2, {"jsonrpc": "2.0", "method": "notifications/initialized"})).text == "raw"
+
+
+# ---------------------------------------------------------------------------
+# End to end through the MCP SDK client
+# ---------------------------------------------------------------------------
+
+
+def _mcp_server(tool_status: int, tool_body: str | None, accepted: dict[str, str] | None = None):
+    """A tiny streamable-HTTP MCP server on a MockTransport.
+
+    tool_body=None answers tools/call with a normal successful result.
+    accepted["token"], if given, is the only bearer the server accepts.
+    """
+
+    seen_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(405)
+        seen_auth.append(request.headers.get("Authorization", ""))
+        if accepted and request.headers.get("Authorization") != f"Bearer {accepted['token']}":
+            return httpx.Response(401, json={"error": "invalid_token"})
+        msg = json.loads(request.content)
+        if "id" not in msg:
+            return httpx.Response(202)
+        if msg["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "result": {
+                        "protocolVersion": msg["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mock", "version": "1"},
+                    },
+                },
+            )
+        if msg["method"] == "tools/list":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "result": {"tools": [{"name": "x", "inputSchema": {"type": "object"}}]},
+                },
+            )
+        if msg["method"] == "tools/call" and tool_body is not None:
+            return httpx.Response(tool_status, text=tool_body)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": msg["id"], "result": {"content": [], "isError": False}},
+        )
+
+    return handler, seen_auth
+
+
+class TestThroughSdk:
+    @pytest.mark.asyncio
+    async def test_server_error_text_reaches_the_caller(self) -> None:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        handler, _ = _mcp_server(403, "[not_entitled] This item isn't included on your current plan.")
+        client = httpx.AsyncClient(transport=ErrorBodyTransport(httpx.MockTransport(handler)))
+        async with client:
+            async with streamable_http_client(SERVER_URL, http_client=client, terminate_on_close=False) as t:
+                async with ClientSession(t[0], t[1]) as session:
+                    await session.initialize()
+                    with pytest.raises(Exception) as exc_info:
+                        await session.call_tool("some_tool", {})
+        assert "not_entitled" in str(exc_info.value)
+        assert "Server returned an error response" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_session_survives_token_rotation(self, store, manager) -> None:
+        """Server stops accepting the token mid-session; next call refreshes, no reconnect."""
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        accepted = {"token": "t1"}
+        handler, seen = _mcp_server(200, None, accepted=accepted)
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("t1", 600))
+
+        auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+        client = httpx.AsyncClient(auth=auth, transport=ErrorBodyTransport(httpx.MockTransport(handler)))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("t2")):
+            async with client:
+                async with streamable_http_client(
+                    SERVER_URL, http_client=client, terminate_on_close=False
+                ) as t:
+                    async with ClientSession(t[0], t[1]) as session:
+                        await session.initialize()
+                        await session.call_tool("x", {})
+                        n_before = len(seen)
+                        accepted["token"] = "t2"  # t1 still "valid" by the clock
+                        result = await session.call_tool("x", {})
+        assert getattr(result, "is_error", getattr(result, "isError", None)) is False
+        assert seen[n_before:] == ["Bearer t1", "Bearer t2"]
+        assert store.get_token(SERVER_URL).access_token == "t2"

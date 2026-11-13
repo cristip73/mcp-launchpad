@@ -16,7 +16,7 @@ import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import keyring
 from cryptography.fernet import Fernet, InvalidToken
@@ -277,6 +277,71 @@ class TokenStore:
                 f"Run 'mcpl auth logout --all' to clear and re-authenticate."
             ) from e
 
+    def _read_encrypted_file_unlocked(self, filename: str) -> dict[str, Any]:
+        """Read and decrypt a JSON file; caller must already hold the file lock."""
+        filepath = self.store_dir / filename
+        if not filepath.exists():
+            return {}
+        try:
+            decrypted_json = self._decrypt(filepath.read_text())
+            result: dict[str, Any] = json.loads(decrypted_json)
+            return result
+        except TokenStoreError as e:
+            raise TokenDecryptionError(
+                f"Cannot decrypt {filename}. The encryption key may have changed. "
+                f"Run 'mcpl auth logout --all' to clear stored tokens and re-authenticate."
+            ) from e
+        except json.JSONDecodeError as e:
+            raise TokenDecryptionError(
+                f"Token file {filename} is corrupted. "
+                f"Run 'mcpl auth logout --all' to clear and re-authenticate."
+            ) from e
+
+    def _write_unlocked(self, filepath: Path, data: dict[str, Any]) -> None:
+        """Encrypt and atomically replace a file; caller must hold the lock.
+
+        Writes to a 0600 temp file in the same directory, then renames it over
+        the target, so a crash mid-write never leaves a truncated token file.
+        """
+        encrypted_data = self._encrypt(json.dumps(data, indent=2))
+        tmp_path = filepath.with_name(f".{filepath.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(encrypted_data)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        try:
+            filepath.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        except OSError as e:
+            logger.warning(f"Could not set file permissions: {e}")
+
+    def _update_encrypted_file(
+        self, filename: str, mutate: Callable[[dict[str, Any]], bool]
+    ) -> bool:
+        """Read-modify-write a file under one exclusive lock.
+
+        Holding the lock across the read and the write prevents a concurrent
+        process (another daemon, a CLI refresh) from losing an update made
+        between our read and our write.
+
+        Args:
+            filename: Name of file in store directory
+            mutate: Changes the dict in place; returns False to skip the write
+
+        Returns:
+            Whatever ``mutate`` returned
+        """
+        filepath = self.store_dir / filename
+        with _file_lock(filepath, exclusive=True):
+            data = self._read_encrypted_file_unlocked(filename)
+            changed = mutate(data)
+            if changed:
+                self._write_unlocked(filepath, data)
+            return changed
+
     def _write_encrypted_file(self, filename: str, data: dict[str, Any]) -> None:
         """Encrypt and write a JSON file with secure permissions and file locking.
 
@@ -288,16 +353,9 @@ class TokenStore:
         """
         filepath = self.store_dir / filename
 
-        json_data = json.dumps(data, indent=2)
-        encrypted_data = self._encrypt(json_data)
-
         # Write with exclusive lock and secure permissions
         with _file_lock(filepath, exclusive=True):  # Exclusive lock for writing
-            filepath.write_text(encrypted_data)
-            try:
-                filepath.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-            except OSError as e:
-                logger.warning(f"Could not set file permissions: {e}")
+            self._write_unlocked(filepath, data)
 
     def _normalize_resource(self, resource: str) -> str:
         """Normalize a resource URL for consistent key lookup.
@@ -342,10 +400,12 @@ class TokenStore:
             token: The token set to store
         """
         key = self._normalize_resource(resource)
-        tokens_data = self._read_encrypted_file(TOKENS_FILE)
 
-        tokens_data[key] = token.to_dict()
-        self._write_encrypted_file(TOKENS_FILE, tokens_data)
+        def _mutate(tokens_data: dict[str, Any]) -> bool:
+            tokens_data[key] = token.to_dict()
+            return True
+
+        self._update_encrypted_file(TOKENS_FILE, _mutate)
 
         logger.debug(f"Stored token for {resource}")
 
@@ -359,16 +419,17 @@ class TokenStore:
             True if token was deleted, False if not found
         """
         key = self._normalize_resource(resource)
-        tokens_data = self._read_encrypted_file(TOKENS_FILE)
 
-        if key not in tokens_data:
-            return False
+        def _mutate(tokens_data: dict[str, Any]) -> bool:
+            if key not in tokens_data:
+                return False
+            del tokens_data[key]
+            return True
 
-        del tokens_data[key]
-        self._write_encrypted_file(TOKENS_FILE, tokens_data)
-
-        logger.debug(f"Deleted token for {resource}")
-        return True
+        deleted = self._update_encrypted_file(TOKENS_FILE, _mutate)
+        if deleted:
+            logger.debug(f"Deleted token for {resource}")
+        return deleted
 
     def list_resources(self) -> list[str]:
         """List all resources with stored tokens.
@@ -437,10 +498,12 @@ class TokenStore:
             client: The client credentials to store
         """
         key = self._normalize_resource(auth_server)
-        clients_data = self._read_encrypted_file(CLIENTS_FILE)
 
-        clients_data[key] = client.to_dict()
-        self._write_encrypted_file(CLIENTS_FILE, clients_data)
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            clients_data[key] = client.to_dict()
+            return True
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
 
         logger.debug(f"Stored client credentials for {auth_server}")
 
@@ -454,16 +517,17 @@ class TokenStore:
             True if deleted, False if not found
         """
         key = self._normalize_resource(auth_server)
-        clients_data = self._read_encrypted_file(CLIENTS_FILE)
 
-        if key not in clients_data:
-            return False
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            if key not in clients_data:
+                return False
+            del clients_data[key]
+            return True
 
-        del clients_data[key]
-        self._write_encrypted_file(CLIENTS_FILE, clients_data)
-
-        logger.debug(f"Deleted client credentials for {auth_server}")
-        return True
+        deleted = self._update_encrypted_file(CLIENTS_FILE, _mutate)
+        if deleted:
+            logger.debug(f"Deleted client credentials for {auth_server}")
+        return deleted
 
     # Utility methods
 

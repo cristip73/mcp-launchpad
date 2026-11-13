@@ -1504,7 +1504,13 @@ def auth_refresh(ctx: click.Context, server: str) -> None:
         click.echo(f"Refreshing token for '{server}'...")
 
     try:
-        refreshed = asyncio.run(oauth_manager.refresh_proactively(url))
+        refreshed = asyncio.run(
+            oauth_manager.refresh_proactively(
+                url,
+                client_id=server_config.get_resolved_oauth_client_id(),
+                client_secret=server_config.get_resolved_oauth_client_secret(),
+            )
+        )
     except Exception as e:
         output.error(e, help_text=f"Try re-authenticating: mcpl auth login {server} --force")
         return

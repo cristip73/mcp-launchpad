@@ -20,6 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .config import Config, ServerConfig, load_config
 from .connection import SSE_READ_TIMEOUT, OAuthRequiredError
+from .http_client import build_http_client
 from .ipc import IPCMessage, create_ipc_server
 from .oauth import get_oauth_manager
 from .platform import (
@@ -221,7 +222,9 @@ class Daemon:
                             expires_at = expires_at.replace(tzinfo=timezone.utc)
                         needs_refresh = (expires_at - now) < timedelta(minutes=10)
                     if needs_refresh:
-                        refreshed = await oauth_manager.refresh_proactively(server_url)
+                        refreshed = await oauth_manager.refresh_proactively(
+                            server_url, min_remaining_seconds=600
+                        )
                         if refreshed:
                             logger.info(
                                 f"Proactively refreshed OAuth token for {server_url}"
@@ -304,25 +307,9 @@ class Daemon:
         attempt = 0
         url = server_config.get_resolved_url()
         headers = server_config.get_resolved_headers()
-
-        # Inject API key or OAuth token if available and no Authorization header configured
-        if "Authorization" not in headers:
-            # Priority: 1) Static API key, 2) OAuth token
-            api_key = server_config.get_resolved_api_key()
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-                logger.debug(f"Using static API key for '{server_name}'")
-            else:
-                oauth_manager = get_oauth_manager()
-                # Proactively refresh expired tokens before connecting
-                if not oauth_manager.has_valid_token(url):
-                    refreshed = await oauth_manager.refresh_if_needed(url)
-                    if refreshed:
-                        logger.info(f"Proactively refreshed expired token for '{server_name}'")
-                auth_header = oauth_manager.get_auth_header(url)
-                if auth_header:
-                    headers["Authorization"] = auth_header
-                    logger.debug(f"Using stored OAuth token for '{server_name}'")
+        # Auth (explicit header > static API key > OAuth from the shared store)
+        # is resolved per request by build_http_client, so a session that
+        # outlives a short-lived access token keeps working.
 
         if not url:
             server_state = ServerState(
@@ -343,10 +330,14 @@ class Daemon:
                 server_state = existing_state
                 server_state.error = None
 
-            # Create httpx client with headers
-            http_client = httpx.AsyncClient(
-                headers=headers,
-                timeout=httpx.Timeout(CONNECTION_TIMEOUT, connect=30.0),
+            http_client = build_http_client(
+                server_name,
+                url,
+                headers,
+                server_config.get_resolved_api_key(),
+                httpx.Timeout(CONNECTION_TIMEOUT, connect=30.0),
+                client_id=server_config.get_resolved_oauth_client_id(),
+                client_secret=server_config.get_resolved_oauth_client_secret(),
             )
             server_state.http_client = http_client
 
@@ -374,44 +365,10 @@ class Daemon:
                             },
                         )
                         if preflight_response.status_code == 401:
-                            # Attempt token refresh before giving up
-                            oauth_mgr = get_oauth_manager()
-                            refreshed = await oauth_mgr.refresh_if_needed(url)
-                            if refreshed:
-                                new_header = oauth_mgr.get_auth_header(url)
-                                if new_header:
-                                    headers["Authorization"] = new_header
-                                    # Update the httpx client with refreshed token
-                                    await http_client.aclose()
-                                    http_client = httpx.AsyncClient(
-                                        headers=headers,
-                                        timeout=httpx.Timeout(CONNECTION_TIMEOUT, connect=30.0),
-                                    )
-                                    server_state.http_client = http_client
-                                    logger.info(f"Refreshed OAuth token for '{server_name}', retrying")
-                                    # Re-do preflight with new token
-                                    preflight_response = await http_client.post(
-                                        url,
-                                        json={
-                                            "jsonrpc": "2.0",
-                                            "method": "initialize",
-                                            "id": 0,
-                                            "params": {
-                                                "protocolVersion": "2024-11-05",
-                                                "capabilities": {},
-                                                "clientInfo": {"name": "mcpl", "version": "0.1.0"},
-                                            },
-                                        },
-                                    )
-                                    if preflight_response.status_code == 401:
-                                        www_auth = preflight_response.headers.get("WWW-Authenticate")
-                                        raise OAuthRequiredError(server_name, url, www_auth)
-                                else:
-                                    www_auth = preflight_response.headers.get("WWW-Authenticate")
-                                    raise OAuthRequiredError(server_name, url, www_auth)
-                            else:
-                                www_auth = preflight_response.headers.get("WWW-Authenticate")
-                                raise OAuthRequiredError(server_name, url, www_auth)
+                            # The OAuth auth flow has already refreshed and
+                            # retried once; a 401 here needs user action.
+                            www_auth = preflight_response.headers.get("WWW-Authenticate")
+                            raise OAuthRequiredError(server_name, url, www_auth)
                     except httpx.RequestError:
                         # If preflight fails for network reasons, proceed and let
                         # streamable_http_client handle the error

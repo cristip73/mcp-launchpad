@@ -728,6 +728,20 @@ class OAuthFlow:
                 )
 
                 self.token_store.set_token(oauth_config.resource_uri, token)
+
+                # A configured (non-DCR) client must be stored too: refresh
+                # looks the client up in the store by authorization server,
+                # and without it every refresh fails with "No client credentials".
+                if self.client_id:
+                    self.token_store.set_client(
+                        oauth_config.auth_server_metadata.issuer,
+                        ClientCredentials(
+                            self.client_id,
+                            self.client_secret,
+                            redirect_uri=redirect_uri,
+                        ),
+                    )
+
                 self._emit_status("Successfully authenticated!")
 
                 return token
