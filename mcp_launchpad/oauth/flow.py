@@ -739,22 +739,23 @@ class OAuthFlow:
                 # Publish token + client as one unit under the OAuth lock, so
                 # a refresh running in another process (started with the old
                 # client) cannot write its result over this login.
+                issuer = oauth_config.auth_server_metadata.issuer
                 async with self.token_store.refresh_lock() as locked:
                     if not locked:
                         logger.warning("OAuth lock busy; publishing the new login anyway")
                     self.token_store.set_token(oauth_config.resource_uri, token)
                     self.token_store.set_client_for_resource(
-                        oauth_config.resource_uri, used_client
+                        oauth_config.resource_uri, used_client, issuer=issuer
                     )
                     if used_client.client_secret:
-                        # A rotated secret must reach every record of this client
+                        # A rotated secret must reach every record of this
+                        # client on this issuer (never another issuer's)
                         self.token_store.propagate_client_secret(
-                            used_client.client_id, used_client.client_secret
+                            issuer, used_client.client_id, used_client.client_secret
                         )
                     if self.client_id:
                         # Configured (non-DCR) client: also fill the issuer
                         # slot, never over a different client_id
-                        issuer = oauth_config.auth_server_metadata.issuer
                         if not self.token_store.set_client_if_compatible(
                             issuer, used_client, replace_same_id=True
                         ):

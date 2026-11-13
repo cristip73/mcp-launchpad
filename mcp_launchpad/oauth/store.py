@@ -562,36 +562,66 @@ class TokenStore:
         """Get the client that obtained the token for a resource, if recorded."""
         return self.get_client(self._RESOURCE_CLIENT_PREFIX + resource)
 
-    def set_client_for_resource(self, resource: str, client: ClientCredentials) -> None:
-        """Record the client that obtained the token for a resource."""
-        self.set_client(self._RESOURCE_CLIENT_PREFIX + resource, client)
+    def get_issuer_for_resource_client(self, resource: str) -> str | None:
+        """Issuer recorded with a resource's client (None if unknown/legacy)."""
+        key = self._normalize_resource(self._RESOURCE_CLIENT_PREFIX + resource)
+        entry = self._read_encrypted_file(CLIENTS_FILE).get(key)
+        issuer = entry.get("issuer") if isinstance(entry, dict) else None
+        return issuer if isinstance(issuer, str) else None
+
+    def set_client_for_resource(
+        self, resource: str, client: ClientCredentials, issuer: str | None = None
+    ) -> None:
+        """Record the client that obtained the token for a resource.
+
+        ``issuer`` scopes the record: client ids are unique only within one
+        authorization server, so secret updates must not cross issuers.
+        """
+        key = self._normalize_resource(self._RESOURCE_CLIENT_PREFIX + resource)
+        entry = client.to_dict()
+        if issuer:
+            entry["issuer"] = self._normalize_resource(issuer)
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            clients_data[key] = entry
+            return True
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
 
     def delete_client_for_resource(self, resource: str) -> bool:
         """Forget the client recorded for a resource."""
         return self.delete_client(self._RESOURCE_CLIENT_PREFIX + resource)
 
-    def propagate_client_secret(self, client_id: str, client_secret: str) -> int:
-        """Set a new secret on every stored record of one client_id.
+    def propagate_client_secret(
+        self, issuer: str, client_id: str, client_secret: str
+    ) -> int:
+        """Set a new secret on every record of one client of one issuer.
 
         The same client can be recorded under its issuer and under several
         resources; a rotated secret must reach all of them, or a stale record
-        keeps being selected. Records of other client ids are never touched.
+        keeps being selected. Scope is (issuer, client_id): client ids are
+        unique only within an authorization server, so records of another
+        issuer - or resource records whose issuer is unknown - are never
+        touched.
 
         Returns:
             Number of records changed
         """
         if not client_secret:
             return 0
+        issuer_key = self._normalize_resource(issuer)
         changed = 0
 
         def _mutate(clients_data: dict[str, Any]) -> bool:
             nonlocal changed
-            for entry in clients_data.values():
-                if (
-                    isinstance(entry, dict)
-                    and entry.get("client_id") == client_id
-                    and entry.get("client_secret") != client_secret
-                ):
+            for key, entry in clients_data.items():
+                if not isinstance(entry, dict) or entry.get("client_id") != client_id:
+                    continue
+                if key.startswith(self._RESOURCE_CLIENT_PREFIX):
+                    same_issuer = entry.get("issuer") == issuer_key
+                else:
+                    same_issuer = key == issuer_key
+                if same_issuer and entry.get("client_secret") != client_secret:
                     entry["client_secret"] = client_secret
                     changed += 1
             return changed > 0

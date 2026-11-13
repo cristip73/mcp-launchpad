@@ -461,15 +461,29 @@ class OAuthManager:
         self._oauth_configs[server_url] = oauth_config
         return oauth_config
 
+    def _client_records(
+        self, auth_server: str, resource: str
+    ) -> tuple[ClientCredentials | None, ClientCredentials | None]:
+        """(resource record, issuer record) for a resource on one issuer.
+
+        A resource record known to belong to a different issuer is ignored:
+        client ids and secrets never cross authorization servers.
+        """
+        by_resource = self._store.get_client_for_resource(resource)
+        if by_resource is not None:
+            recorded = self._store.get_issuer_for_resource_client(resource)
+            if recorded is not None and recorded != auth_server.rstrip("/").lower():
+                by_resource = None
+        by_issuer = self._store.get_client(auth_server)
+        return by_resource, by_issuer
+
     def _lookup_client(self, auth_server: str, resource: str) -> ClientCredentials | None:
         """Client for a resource without config: resource record, then issuer.
 
-        If the chosen record has no secret but another stored record of the
-        same client_id has one, that secret is used (same client, never a
-        different one).
+        If the chosen record has no secret but the other record (same issuer)
+        has the same client_id with a secret, that secret is used.
         """
-        by_resource = self._store.get_client_for_resource(resource)
-        by_issuer = self._store.get_client(auth_server)
+        by_resource, by_issuer = self._client_records(auth_server, resource)
         chosen = by_resource or by_issuer
         if chosen is None or chosen.client_secret:
             return chosen
@@ -496,8 +510,17 @@ class OAuthManager:
         if not client_id:
             return self._lookup_client(auth_server, resource)
 
-        by_resource = self._store.get_client_for_resource(resource)
-        by_issuer = self._store.get_client(auth_server)
+        by_resource, by_issuer = self._client_records(auth_server, resource)
+        if (
+            by_resource is not None
+            and self._store.get_issuer_for_resource_client(resource) is None
+        ):
+            # Record written without its issuer (earlier build): we know it now,
+            # and the scoped secret propagation below needs it.
+            try:
+                self._store.set_client_for_resource(resource, by_resource, issuer=auth_server)
+            except Exception as e:  # pragma: no cover - best effort
+                logger.debug(f"Could not record issuer for {resource}: {e}")
         same_id = [
             c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id
         ]
@@ -507,10 +530,10 @@ class OAuthManager:
         client = ClientCredentials(client_id, secret)
         try:
             if client_secret:
-                self._store.propagate_client_secret(client_id, client_secret)
+                self._store.propagate_client_secret(auth_server, client_id, client_secret)
             # Fill only empty slots: never clobber another server's client
             if by_resource is None:
-                self._store.set_client_for_resource(resource, client)
+                self._store.set_client_for_resource(resource, client, issuer=auth_server)
             self._store.set_client_if_compatible(auth_server, client)
         except Exception as e:  # pragma: no cover - best effort
             logger.debug(f"Could not persist configured client for {auth_server}: {e}")

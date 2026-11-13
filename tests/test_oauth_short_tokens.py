@@ -977,7 +977,7 @@ class TestReviewRound3:
     @pytest.mark.asyncio
     async def test_rotated_secret_reaches_every_record_of_the_client(self, store) -> None:
         """R3-B2 (b): a login with a new secret updates the other resources' records."""
-        store.set_client_for_resource(RESOURCE_A, ClientCredentials("shared", "old-secret"))
+        store.set_client_for_resource(RESOURCE_A, ClientCredentials("shared", "old-secret"), issuer=ISSUER)
         store.set_client(ISSUER, ClientCredentials("shared", "old-secret"))
         store.set_client_for_resource("https://other-client.example.com", ClientCredentials("other", "keep"))
         flow = OAuthFlow(server_url=RESOURCE_B, token_store=store, client_id="shared",
@@ -1020,3 +1020,63 @@ class TestReviewRound3:
         assert store.get_client_for_resource(SERVER_URL) is None
         assert store.get_client(ISSUER).client_id == "client-a"
         assert store.get_token(SERVER_URL) is None
+
+
+
+# ---------------------------------------------------------------------------
+# Review round 4 (Codex) regressions
+# ---------------------------------------------------------------------------
+
+ISSUER_2 = "https://auth.other-vendor.example.com"
+
+
+class TestReviewRound4:
+    @pytest.mark.asyncio
+    async def test_secret_propagation_never_crosses_issuers(self, store) -> None:
+        """R4-B1: same client_id "mcpl" registered at two unrelated issuers."""
+        store.set_client(ISSUER_2, ClientCredentials("mcpl", "secret-of-issuer-2"))
+        store.set_client_for_resource(RESOURCE_A, ClientCredentials("mcpl", "secret-of-issuer-2"), issuer=ISSUER_2)
+        flow = OAuthFlow(server_url=RESOURCE_B, token_store=store, client_id="mcpl",
+                         client_secret="secret-of-issuer-1")
+        await _run_login(flow)  # issuer of RESOURCE_B is ISSUER
+        assert store.get_client(ISSUER).client_secret == "secret-of-issuer-1"
+        assert store.get_client(ISSUER_2).client_secret == "secret-of-issuer-2"
+        assert store.get_client_for_resource(RESOURCE_A).client_secret == "secret-of-issuer-2"
+
+        # Issuer-2's server refreshes with its own secret
+        m = OAuthManager(_store=store)
+        cfg_a = _oauth_config()
+        cfg_a.resource_uri = RESOURCE_A
+        cfg_a.auth_server_metadata.issuer = ISSUER_2
+        m._oauth_configs[RESOURCE_A] = cfg_a
+        store.set_token(RESOURCE_A, _token("a-old", -10))
+        refresh = _refresh_mock("a-new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await m.refresh_if_needed(RESOURCE_A)
+        assert refresh.await_args.args[1].client_secret == "secret-of-issuer-2"
+
+    def test_records_with_unknown_issuer_are_not_propagated_into(self, store) -> None:
+        store.set_client_for_resource(RESOURCE_A, ClientCredentials("mcpl", "legacy"))
+        assert store.propagate_client_secret(ISSUER, "mcpl", "new") == 0
+        assert store.get_client_for_resource(RESOURCE_A).client_secret == "legacy"
+
+    @pytest.mark.asyncio
+    async def test_resource_record_of_another_issuer_is_ignored(self, store, manager) -> None:
+        store.set_client_for_resource(SERVER_URL, ClientCredentials("x", "foreign"), issuer=ISSUER_2)
+        store.set_client(ISSUER, ClientCredentials("right-client", "right-secret"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_if_needed(SERVER_URL)
+        used = refresh.await_args.args[1]
+        assert (used.client_id, used.client_secret) == ("right-client", "right-secret")
+
+    @pytest.mark.asyncio
+    async def test_issuerless_record_is_upgraded_then_propagated(self, store, manager) -> None:
+        """A record written by an earlier build (no issuer) gets it at refresh."""
+        store.set_client_for_resource(SERVER_URL, ClientCredentials("cid", "stale"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("new")):
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="cid", client_secret="fresh")
+        assert store.get_issuer_for_resource_client(SERVER_URL) == ISSUER
+        assert store.get_client_for_resource(SERVER_URL).client_secret == "fresh"
