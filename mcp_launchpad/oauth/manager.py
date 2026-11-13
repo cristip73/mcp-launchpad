@@ -4,10 +4,8 @@ This module provides the main interface for OAuth operations, used by
 both the CLI and daemon to manage authentication for MCP servers.
 """
 
-import asyncio
 import logging
 import os
-import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -18,13 +16,9 @@ from urllib.parse import urlparse
 
 from .discovery import DiscoveryError, OAuthConfig, discover_oauth_config
 from .flow import OAuthFlow, OAuthFlowError, TokenExchangeError, refresh_token, revoke_token
+from .store import REFRESH_LOCK_FILE as STORE_REFRESH_LOCK_FILE
 from .store import TokenDecryptionError, TokenStore
 from .tokens import ClientCredentials, TokenSet
-
-if sys.platform != "win32":
-    import fcntl
-else:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +27,7 @@ logger = logging.getLogger(__name__)
 REFRESH_BUFFER_SECONDS = int(os.environ.get("MCPL_OAUTH_REFRESH_BUFFER", "60"))
 
 # Cross-process lock serializing token refreshes (lives in the store dir)
-REFRESH_LOCK_FILE = "refresh.lock"
+REFRESH_LOCK_FILE = STORE_REFRESH_LOCK_FILE
 REFRESH_LOCK_TIMEOUT = 60
 
 
@@ -430,40 +424,14 @@ class OAuthManager:
 
     @asynccontextmanager
     async def _refresh_lock(self) -> AsyncIterator[bool]:
-        """Hold the cross-process refresh lock (polling, never blocks the loop).
+        """The store's cross-process OAuth lock (see TokenStore.refresh_lock).
 
-        Yields True when the lock is held. If it cannot be taken within
-        REFRESH_LOCK_TIMEOUT seconds it yields False, and callers must NOT
-        redeem the refresh token (fail closed: another process is mid-refresh
-        and a second redemption could invalidate a rotating refresh token).
+        Yields False after REFRESH_LOCK_TIMEOUT seconds; refresh callers must
+        then NOT redeem the refresh token (fail closed: another process is
+        mid-refresh and a second redemption could invalidate a rotating one).
         """
-        if fcntl is None:  # pragma: no cover - Windows: no cross-process lock
-            yield True
-            return
-        lock_path = self._store.store_dir / REFRESH_LOCK_FILE
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        locked = False
-        try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + REFRESH_LOCK_TIMEOUT
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    locked = True
-                    break
-                except BlockingIOError:
-                    if loop.time() >= deadline:
-                        logger.warning(
-                            "OAuth refresh lock busy for "
-                            f"{REFRESH_LOCK_TIMEOUT}s; not refreshing this time"
-                        )
-                        break
-                    await asyncio.sleep(0.1)
+        async with self._store.refresh_lock(timeout=REFRESH_LOCK_TIMEOUT) as locked:
             yield locked
-        finally:
-            if locked:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
 
     @staticmethod
     def _needs_refresh(
@@ -493,6 +461,23 @@ class OAuthManager:
         self._oauth_configs[server_url] = oauth_config
         return oauth_config
 
+    def _lookup_client(self, auth_server: str, resource: str) -> ClientCredentials | None:
+        """Client for a resource without config: resource record, then issuer.
+
+        If the chosen record has no secret but another stored record of the
+        same client_id has one, that secret is used (same client, never a
+        different one).
+        """
+        by_resource = self._store.get_client_for_resource(resource)
+        by_issuer = self._store.get_client(auth_server)
+        chosen = by_resource or by_issuer
+        if chosen is None or chosen.client_secret:
+            return chosen
+        for other in (by_resource, by_issuer):
+            if other is not None and other.client_id == chosen.client_id and other.client_secret:
+                return ClientCredentials(chosen.client_id, other.client_secret, chosen.redirect_uri)
+        return chosen
+
     def _select_client(
         self,
         auth_server: str,
@@ -502,25 +487,28 @@ class OAuthManager:
     ) -> ClientCredentials | None:
         """Pick the client credentials to redeem this resource's refresh token.
 
-        Order: the server's configured client id (authoritative), then the
-        client recorded for this resource at login, then the issuer client.
-        A stored secret is reused only for the same client_id, never borrowed
-        from a different client.
+        Caller holds the refresh lock. Order: the server's configured client
+        id (authoritative), then the client recorded for this resource at
+        login, then the issuer client. A stored secret is reused only for the
+        same client_id; an explicit (configured) secret is propagated to every
+        stored record of that client_id.
         """
+        if not client_id:
+            return self._lookup_client(auth_server, resource)
+
         by_resource = self._store.get_client_for_resource(resource)
         by_issuer = self._store.get_client(auth_server)
-
-        if not client_id:
-            return by_resource or by_issuer
-
-        same_id = next(
-            (c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id),
-            None,
+        same_id = [
+            c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id
+        ]
+        secret = client_secret or next(
+            (c.client_secret for c in same_id if c.client_secret), None
         )
-        secret = client_secret if client_secret else (same_id.client_secret if same_id else None)
         client = ClientCredentials(client_id, secret)
-        # Persist only into empty slots: never clobber another server's client
         try:
+            if client_secret:
+                self._store.propagate_client_secret(client_id, client_secret)
+            # Fill only empty slots: never clobber another server's client
             if by_resource is None:
                 self._store.set_client_for_resource(resource, client)
             self._store.set_client_if_compatible(auth_server, client)
@@ -753,7 +741,10 @@ class OAuthManager:
         # Attempt server-side revocation if we have config
         if oauth_config and oauth_config.auth_server_metadata.supports_revocation():
             auth_server = oauth_config.auth_server_metadata.issuer
-            client = self._store.get_client(auth_server)
+            # Same selection as refresh: the client that obtained this token
+            client = self._lookup_client(
+                auth_server, oauth_config.resource_uri or token.resource
+            )
 
             if client:
                 # Revoke access token
@@ -773,8 +764,14 @@ class OAuthManager:
                         token_type_hint="refresh_token",
                     )
 
-        # Always delete local token
+        # Always delete local token (and the client recorded for it)
         deleted = self._store.delete_token(server_url)
+        try:
+            resource = (oauth_config.resource_uri if oauth_config else None) or token.resource
+            if resource:
+                self._store.delete_client_for_resource(resource)
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug(f"Could not forget resource client for {server_url}: {e}")
         if deleted:
             logger.info(f"Logged out from {server_url}")
         return deleted

@@ -727,11 +727,6 @@ class OAuthFlow:
                     f"scope={token.scope}{lifetime}"
                 )
 
-                self.token_store.set_token(oauth_config.resource_uri, token)
-
-                # A configured (non-DCR) client must be stored too: refresh
-                # looks the client up in the store by authorization server,
-                # and without it every refresh fails with "No client credentials".
                 # Remember which client obtained this token: refresh must use
                 # the same one. Stored per resource, because the issuer slot
                 # may be shared with another server using a different client.
@@ -740,18 +735,33 @@ class OAuthFlow:
                     used_client = ClientCredentials(
                         client.client_id, client.client_secret, redirect_uri=redirect_uri
                     )
-                self.token_store.set_client_for_resource(oauth_config.resource_uri, used_client)
-                if self.client_id:
-                    # Configured (non-DCR) client: also fill the issuer slot,
-                    # atomically and never over a different client_id
-                    issuer = oauth_config.auth_server_metadata.issuer
-                    if not self.token_store.set_client_if_compatible(
-                        issuer, used_client, replace_same_id=True
-                    ):
-                        logger.info(
-                            f"A different client is stored for {issuer}; kept it. "
-                            f"This server's client is stored for its resource."
+
+                # Publish token + client as one unit under the OAuth lock, so
+                # a refresh running in another process (started with the old
+                # client) cannot write its result over this login.
+                async with self.token_store.refresh_lock() as locked:
+                    if not locked:
+                        logger.warning("OAuth lock busy; publishing the new login anyway")
+                    self.token_store.set_token(oauth_config.resource_uri, token)
+                    self.token_store.set_client_for_resource(
+                        oauth_config.resource_uri, used_client
+                    )
+                    if used_client.client_secret:
+                        # A rotated secret must reach every record of this client
+                        self.token_store.propagate_client_secret(
+                            used_client.client_id, used_client.client_secret
                         )
+                    if self.client_id:
+                        # Configured (non-DCR) client: also fill the issuer
+                        # slot, never over a different client_id
+                        issuer = oauth_config.auth_server_metadata.issuer
+                        if not self.token_store.set_client_if_compatible(
+                            issuer, used_client, replace_same_id=True
+                        ):
+                            logger.info(
+                                f"A different client is stored for {issuer}; kept it. "
+                                f"This server's client is stored for its resource."
+                            )
 
                 self._emit_status("Successfully authenticated!")
 

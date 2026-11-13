@@ -7,6 +7,7 @@ This module provides secure storage for OAuth tokens using:
 - File locking to prevent race conditions
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -14,9 +15,9 @@ import logging
 import os
 import stat
 import sys
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator
+from typing import Any, AsyncIterator, Callable, Generator
 
 import keyring
 from cryptography.fernet import Fernet, InvalidToken
@@ -89,6 +90,10 @@ DEFAULT_STORE_DIR = Path.home() / ".cache" / "mcp-launchpad" / "oauth"
 # File names
 TOKENS_FILE = "tokens.json"
 CLIENTS_FILE = "clients.json"
+
+# Cross-process lock serializing token refreshes and login publication
+REFRESH_LOCK_FILE = "refresh.lock"
+DEFAULT_REFRESH_LOCK_TIMEOUT = 60.0
 
 
 class TokenStoreError(Exception):
@@ -357,6 +362,45 @@ class TokenStore:
         with _file_lock(filepath, exclusive=True):  # Exclusive lock for writing
             self._write_unlocked(filepath, data)
 
+    @asynccontextmanager
+    async def refresh_lock(
+        self, timeout: float = DEFAULT_REFRESH_LOCK_TIMEOUT
+    ) -> AsyncIterator[bool]:
+        """Hold the cross-process OAuth lock (polling, never blocks the loop).
+
+        Serializes token refreshes with each other and with login's final
+        publication of a token and its client, so a refresh started with an
+        old client can never write its result over a newer login.
+
+        Yields True when the lock is held, False if it could not be taken
+        within ``timeout`` seconds. Callers decide what to do without it:
+        a refresh must not redeem (fail closed); a login still publishes.
+        """
+        if sys.platform == "win32":  # pragma: no cover - no cross-process lock
+            yield True
+            return
+        lock_path = self.store_dir / REFRESH_LOCK_FILE
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        locked = False
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if loop.time() >= deadline:
+                        logger.warning(f"OAuth lock busy for {timeout}s")
+                        break
+                    await asyncio.sleep(0.1)
+            yield locked
+        finally:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _normalize_resource(self, resource: str) -> str:
         """Normalize a resource URL for consistent key lookup.
 
@@ -521,6 +565,39 @@ class TokenStore:
     def set_client_for_resource(self, resource: str, client: ClientCredentials) -> None:
         """Record the client that obtained the token for a resource."""
         self.set_client(self._RESOURCE_CLIENT_PREFIX + resource, client)
+
+    def delete_client_for_resource(self, resource: str) -> bool:
+        """Forget the client recorded for a resource."""
+        return self.delete_client(self._RESOURCE_CLIENT_PREFIX + resource)
+
+    def propagate_client_secret(self, client_id: str, client_secret: str) -> int:
+        """Set a new secret on every stored record of one client_id.
+
+        The same client can be recorded under its issuer and under several
+        resources; a rotated secret must reach all of them, or a stale record
+        keeps being selected. Records of other client ids are never touched.
+
+        Returns:
+            Number of records changed
+        """
+        if not client_secret:
+            return 0
+        changed = 0
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            nonlocal changed
+            for entry in clients_data.values():
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("client_id") == client_id
+                    and entry.get("client_secret") != client_secret
+                ):
+                    entry["client_secret"] = client_secret
+                    changed += 1
+            return changed > 0
+
+        self._update_encrypted_file(CLIENTS_FILE, _mutate)
+        return changed
 
     def set_client_if_compatible(
         self,

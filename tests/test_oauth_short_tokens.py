@@ -904,3 +904,119 @@ async def test_background_refresh_skips_freshly_issued_short_token(store) -> Non
         store.set_token(SERVER_URL, aging)
         await daemon_module.Daemon._refresh_oauth_tokens_once(d)
     assert refresh.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (Codex) regressions
+# ---------------------------------------------------------------------------
+
+
+class TestReviewRound3:
+    @pytest.mark.asyncio
+    async def test_login_waits_for_running_refresh_and_wins(self, store) -> None:
+        """R3-B1: a refresh started with client A cannot overwrite login B's pair."""
+        m = OAuthManager(_store=store)
+        m._oauth_configs[SERVER_URL] = _oauth_config()
+        store.set_client(ISSUER, ClientCredentials("client-a"))
+        store.set_token(SERVER_URL, _token("a-old", -10, refresh="rt-a"))
+
+        refresh_started = asyncio.Event()
+
+        async def slow_refresh(md, client, rt, resource):
+            refresh_started.set()
+            await asyncio.sleep(0.5)
+            return {"access_token": "a-new", "expires_in": 600, "refresh_token": "rt-a2"}
+
+        with patch.object(manager_module, "refresh_token", slow_refresh):
+            refresh_task = asyncio.create_task(m.get_fresh_token(SERVER_URL))
+            await refresh_started.wait()
+            flow = OAuthFlow(server_url=SERVER_URL, token_store=store, client_id="client-b")
+            await _run_login(flow)  # publishes after the refresh released the lock
+            await refresh_task
+
+        tok = store.get_token(SERVER_URL)
+        assert tok.access_token == "at" and tok.refresh_token == "rt"  # login's pair
+        assert store.get_client_for_resource(SERVER_URL).client_id == "client-b"
+
+    @pytest.mark.asyncio
+    async def test_refresh_after_login_rereads_and_does_not_redeem(self, store) -> None:
+        """R3-B1, other order: login first, then a refresh that read the old token."""
+        m = OAuthManager(_store=store)
+        m._oauth_configs[SERVER_URL] = _oauth_config()
+        store.set_client(ISSUER, ClientCredentials("client-a"))
+        store.set_token(SERVER_URL, _token("a-old", -10, refresh="rt-a"))
+        refresh = _refresh_mock("should-not-happen")
+        fd = os.open(store.store_dir / manager_module.REFRESH_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # "login in progress" holds the lock
+        try:
+            with patch.object(manager_module, "refresh_token", refresh):
+                task = asyncio.create_task(m.get_fresh_token(SERVER_URL))
+                await asyncio.sleep(0.3)
+                store.set_token(SERVER_URL, _token("b-login", 600, refresh="rt-b"))
+                store.set_client_for_resource(SERVER_URL, ClientCredentials("client-b"))
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                tok = await asyncio.wait_for(task, 5)
+        finally:
+            os.close(fd)
+        assert tok.access_token == "b-login"
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_secretless_resource_record_does_not_mask_issuer_secret(self, store, manager) -> None:
+        """R3-B2 (a)."""
+        store.set_client_for_resource(SERVER_URL, ClientCredentials("cid"))
+        store.set_client(ISSUER, ClientCredentials("cid", "issuer-secret"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new", "new2")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_if_needed(SERVER_URL)  # no config
+            assert await manager.refresh_proactively(SERVER_URL, client_id="cid")  # with config
+        for call in refresh.await_args_list:
+            assert call.args[1].client_secret == "issuer-secret"
+
+    @pytest.mark.asyncio
+    async def test_rotated_secret_reaches_every_record_of_the_client(self, store) -> None:
+        """R3-B2 (b): a login with a new secret updates the other resources' records."""
+        store.set_client_for_resource(RESOURCE_A, ClientCredentials("shared", "old-secret"))
+        store.set_client(ISSUER, ClientCredentials("shared", "old-secret"))
+        store.set_client_for_resource("https://other-client.example.com", ClientCredentials("other", "keep"))
+        flow = OAuthFlow(server_url=RESOURCE_B, token_store=store, client_id="shared",
+                         client_secret="new-secret")
+        await _run_login(flow)
+        assert store.get_client_for_resource(RESOURCE_A).client_secret == "new-secret"
+        assert store.get_client(ISSUER).client_secret == "new-secret"
+        assert store.get_client_for_resource("https://other-client.example.com").client_secret == "keep"
+
+        # Background refresh of A (no config) now uses the new secret
+        m = OAuthManager(_store=store)
+        cfg_a = _oauth_config()
+        cfg_a.resource_uri = RESOURCE_A
+        m._oauth_configs[RESOURCE_A] = cfg_a
+        store.set_token(RESOURCE_A, _token("a-old", -10))
+        refresh = _refresh_mock("a-new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await m.refresh_if_needed(RESOURCE_A)
+        assert refresh.await_args.args[1].client_secret == "new-secret"
+
+    @pytest.mark.asyncio
+    async def test_configured_secret_is_propagated(self, store, manager) -> None:
+        store.set_client_for_resource(SERVER_URL, ClientCredentials("cid", "stale"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("new")):
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="cid", client_secret="fresh")
+        assert store.get_client_for_resource(SERVER_URL).client_secret == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_logout_revokes_with_the_resource_client_and_forgets_it(self, store, manager) -> None:
+        """R3-M3."""
+        store.set_client(ISSUER, ClientCredentials("client-a"))
+        store.set_client_for_resource(SERVER_URL, ClientCredentials("client-b"))
+        store.set_token(SERVER_URL, _token("b-at", 600, refresh="b-rt"))
+        manager._oauth_configs[SERVER_URL].auth_server_metadata.supports_revocation.return_value = True
+        revoke = AsyncMock(return_value=True)
+        with patch.object(manager_module, "revoke_token", revoke):
+            assert await manager.logout_async(SERVER_URL)
+        assert [c.args[1].client_id for c in revoke.await_args_list] == ["client-b", "client-b"]
+        assert store.get_client_for_resource(SERVER_URL) is None
+        assert store.get_client(ISSUER).client_id == "client-a"
+        assert store.get_token(SERVER_URL) is None
