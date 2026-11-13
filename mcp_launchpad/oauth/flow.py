@@ -732,25 +732,25 @@ class OAuthFlow:
                 # A configured (non-DCR) client must be stored too: refresh
                 # looks the client up in the store by authorization server,
                 # and without it every refresh fails with "No client credentials".
-                # Never overwrite a different client stored for the same issuer
-                # (another server's DCR client); refresh then falls back to
-                # the configured client id passed from the server config.
+                # Remember which client obtained this token: refresh must use
+                # the same one. Stored per resource, because the issuer slot
+                # may be shared with another server using a different client.
+                used_client = client
+                if self.client_id and not client.redirect_uri:
+                    used_client = ClientCredentials(
+                        client.client_id, client.client_secret, redirect_uri=redirect_uri
+                    )
+                self.token_store.set_client_for_resource(oauth_config.resource_uri, used_client)
                 if self.client_id:
+                    # Configured (non-DCR) client: also fill the issuer slot,
+                    # atomically and never over a different client_id
                     issuer = oauth_config.auth_server_metadata.issuer
-                    existing = self.token_store.get_client(issuer)
-                    if existing is None or existing.client_id == self.client_id:
-                        self.token_store.set_client(
-                            issuer,
-                            ClientCredentials(
-                                self.client_id,
-                                self.client_secret,
-                                redirect_uri=redirect_uri,
-                            ),
-                        )
-                    else:
-                        logger.warning(
-                            f"A different client is stored for {issuer}; keeping it. "
-                            f"Refresh for this server uses its configured oauth_client_id."
+                    if not self.token_store.set_client_if_compatible(
+                        issuer, used_client, replace_same_id=True
+                    ):
+                        logger.info(
+                            f"A different client is stored for {issuer}; kept it. "
+                            f"This server's client is stored for its resource."
                         )
 
                 self._emit_status("Successfully authenticated!")

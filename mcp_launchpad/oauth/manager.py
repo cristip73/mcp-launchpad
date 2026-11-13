@@ -493,6 +493,41 @@ class OAuthManager:
         self._oauth_configs[server_url] = oauth_config
         return oauth_config
 
+    def _select_client(
+        self,
+        auth_server: str,
+        resource: str,
+        client_id: str | None,
+        client_secret: str | None,
+    ) -> ClientCredentials | None:
+        """Pick the client credentials to redeem this resource's refresh token.
+
+        Order: the server's configured client id (authoritative), then the
+        client recorded for this resource at login, then the issuer client.
+        A stored secret is reused only for the same client_id, never borrowed
+        from a different client.
+        """
+        by_resource = self._store.get_client_for_resource(resource)
+        by_issuer = self._store.get_client(auth_server)
+
+        if not client_id:
+            return by_resource or by_issuer
+
+        same_id = next(
+            (c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id),
+            None,
+        )
+        secret = client_secret if client_secret else (same_id.client_secret if same_id else None)
+        client = ClientCredentials(client_id, secret)
+        # Persist only into empty slots: never clobber another server's client
+        try:
+            if by_resource is None:
+                self._store.set_client_for_resource(resource, client)
+            self._store.set_client_if_compatible(auth_server, client)
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug(f"Could not persist configured client for {auth_server}: {e}")
+        return client
+
     async def _do_refresh(
         self,
         server_url: str,
@@ -517,21 +552,12 @@ class OAuthManager:
             return None
 
         auth_server = oauth_config.auth_server_metadata.issuer
-        stored_client = self._store.get_client(auth_server)
-        client: ClientCredentials | None
-        if client_id:
-            # The server's configured client is authoritative for its tokens;
-            # the store keys clients by issuer only, and another server on the
-            # same issuer may have stored a different (e.g. DCR) client there.
-            client = ClientCredentials(client_id, client_secret)
-            if stored_client is None:
-                # Persist it so processes without the config can refresh too
-                try:
-                    self._store.set_client(auth_server, client)
-                except Exception as e:  # pragma: no cover - best effort
-                    logger.debug(f"Could not persist configured client for {auth_server}: {e}")
-        else:
-            client = stored_client
+        client = self._select_client(
+            auth_server,
+            oauth_config.resource_uri or server_url,
+            client_id,
+            client_secret,
+        )
         if client is None:
             logger.warning(
                 f"No client credentials for {auth_server}. Set oauth_client_id "

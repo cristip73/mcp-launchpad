@@ -49,6 +49,20 @@ def token_fingerprint(access_token: str) -> str:
     return hashlib.sha256(access_token.encode()).hexdigest()[:10]
 
 
+# Request extension listing every bearer this auth flow put on the request.
+# The retry mutates the same request, so its final headers only show the
+# last token; the redaction of error bodies needs all of them.
+SENT_BEARERS_EXTENSION = "mcpl_sent_bearers"
+
+
+def _set_bearer(request: httpx.Request, header_value: str) -> None:
+    request.headers["Authorization"] = header_value
+    sent = request.extensions.setdefault(SENT_BEARERS_EXTENSION, [])
+    secret = header_value[7:].strip() if header_value.lower().startswith("bearer ") else ""
+    if secret and secret not in sent:
+        sent.append(secret)
+
+
 class OAuthBearerAuth(httpx.Auth):
     """Bearer auth that always uses the freshest token from the shared store."""
 
@@ -103,7 +117,7 @@ class OAuthBearerAuth(httpx.Auth):
         token = await self._token()
         used = token.access_token if token is not None else None
         if token is not None:
-            request.headers["Authorization"] = token.get_auth_header()
+            _set_bearer(request, token.get_auth_header())
             logger.debug(
                 f"OAuth {request.method} {self.server_url} token fp={token_fingerprint(token.access_token)}"
             )
@@ -122,7 +136,7 @@ class OAuthBearerAuth(httpx.Auth):
             f"Server rejected the OAuth token for {self.server_url}; retrying with "
             f"fp={token_fingerprint(new_token.access_token)}"
         )
-        request.headers["Authorization"] = new_token.get_auth_header()
+        _set_bearer(request, new_token.get_auth_header())
         yield request
 
 
@@ -168,14 +182,18 @@ def _bearer_secrets(response: httpx.Response) -> list[str]:
     secrets: list[str] = []
     for resp in [*response.history, response]:
         try:
-            auth = resp.request.headers.get("Authorization", "")
+            req = resp.request
         except RuntimeError:  # response without a request
             continue
+        candidates = list(req.extensions.get(SENT_BEARERS_EXTENSION, []))
+        auth = req.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
-            secret = auth[7:].strip()
+            candidates.append(auth[7:].strip())
+        for secret in candidates:
             if secret and secret not in secrets:
                 secrets.append(secret)
-    return secrets
+    # Longest first, so a token containing another is fully redacted
+    return sorted(secrets, key=len, reverse=True)
 
 
 def _redact(text: str, secrets: list[str]) -> str:
@@ -270,9 +288,21 @@ class McpHttpClient(httpx.AsyncClient):
     auth flow, so 401 refresh/retry still sees the original response.
     """
 
-    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
-        response = await super().send(request, **kwargs)
-        return await rewrite_error_response(request, response)
+    async def send(
+        self, request: httpx.Request, *, stream: bool = False, **kwargs: Any
+    ) -> httpx.Response:
+        # Always stream internally so an error body is read bounded (also for
+        # plain .post() calls such as the connection preflight), then honour
+        # the caller's buffering choice.
+        response = await super().send(request, stream=True, **kwargs)
+        response = await rewrite_error_response(request, response)
+        if not stream:
+            try:
+                await response.aread()
+            except BaseException:
+                await response.aclose()
+                raise
+        return response
 
 
 def build_http_client(

@@ -649,3 +649,258 @@ class TestReviewRound1:
 
         r = await asyncio.wait_for(go(), 5)
         assert r.status_code == 200 and r.json() == result
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 (Codex) regressions + extra coverage
+# ---------------------------------------------------------------------------
+
+RESOURCE_A = "https://a.example.com"
+RESOURCE_B = SERVER_URL
+
+
+class TestReviewRound2:
+    @pytest.mark.asyncio
+    async def test_bearer_sent_before_retry_is_redacted(self, store, manager) -> None:
+        """R2-B1: the retry mutates the request; the first bearer must still be redacted."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.headers.get("Authorization") == "Bearer old-secret":
+                return httpx.Response(401, json={"error": "invalid_token"})
+            return httpx.Response(500, text="saw old-secret and new-secret")
+
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old-secret", 600))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("new-secret")):
+            auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+            async with McpHttpClient(auth=auth, transport=httpx.MockTransport(handler)) as c:
+                r = await c.post(SERVER_URL, json=_rpc())
+        assert "old-secret" not in r.text and "new-secret" not in r.text
+        assert r.json()["error"]["message"].count("[redacted]") == 2
+
+    @pytest.mark.asyncio
+    async def test_configured_id_keeps_stored_secret_of_same_id(self, store, manager) -> None:
+        """R2-B2: secret given at login (stdin/env) is reused for the same client id."""
+        store.set_client(ISSUER, ClientCredentials("cid", "stored-secret"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="cid")
+        used = refresh.await_args.args[1]
+        assert (used.client_id, used.client_secret) == ("cid", "stored-secret")
+
+    @pytest.mark.asyncio
+    async def test_secret_of_a_different_client_is_never_borrowed(self, store, manager) -> None:
+        store.set_client(ISSUER, ClientCredentials("other", "others-secret"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="cid")
+        used = refresh.await_args.args[1]
+        assert (used.client_id, used.client_secret) == ("cid", None)
+        assert store.get_client(ISSUER).client_id == "other"  # untouched
+
+    @pytest.mark.asyncio
+    async def test_login_client_kept_per_resource_when_issuer_taken(self, store) -> None:
+        """R2-B3: server A has a DCR client on the issuer; login B with client-B.
+
+        B's client must survive (per resource) and be used for B's refresh even
+        without config (e.g. the daemon's background loop); A keeps its client.
+        """
+        store.set_client(ISSUER, ClientCredentials("dcr-a"))
+        flow = OAuthFlow(server_url=RESOURCE_B, token_store=store, client_id="client-b",
+                         client_secret="secret-b")
+        await _run_login(flow)
+        assert store.get_client(ISSUER).client_id == "dcr-a"
+        assert store.get_client_for_resource(RESOURCE_B).client_id == "client-b"
+
+        m = OAuthManager(_store=store)
+        cfg_a = _oauth_config()
+        cfg_a.resource_uri = RESOURCE_A
+        m._oauth_configs[RESOURCE_B] = _oauth_config()
+        m._oauth_configs[RESOURCE_A] = cfg_a
+        store.set_token(RESOURCE_B, _token("b-old", -10))
+        store.set_token(RESOURCE_A, _token("a-old", -10))
+        refresh = _refresh_mock("b-new", "a-new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await m.refresh_if_needed(RESOURCE_B)  # no client_id passed
+            assert await m.refresh_if_needed(RESOURCE_A)
+        used_b, used_a = (call.args[1] for call in refresh.await_args_list)
+        assert (used_b.client_id, used_b.client_secret) == ("client-b", "secret-b")
+        assert used_a.client_id == "dcr-a"
+
+    def test_set_client_if_compatible(self, store) -> None:
+        """R2-M5: conditional issuer write is atomic and never clobbers another id."""
+        assert store.set_client_if_compatible(ISSUER, ClientCredentials("x", "s1"))
+        assert not store.set_client_if_compatible(ISSUER, ClientCredentials("x", "s2"))
+        assert store.set_client_if_compatible(ISSUER, ClientCredentials("x", "s2"), replace_same_id=True)
+        assert store.get_client(ISSUER).client_secret == "s2"
+        assert not store.set_client_if_compatible(ISSUER, ClientCredentials("y"), replace_same_id=True)
+        assert store.get_client(ISSUER).client_id == "x"
+
+    def test_resource_entries_do_not_disturb_issuer_lookup(self, store) -> None:
+        """Old mcpl reads clients by issuer only; the new resource entries sit beside them."""
+        store.set_client(ISSUER, ClientCredentials("issuer-client"))
+        store.set_client_for_resource(RESOURCE_B, ClientCredentials("resource-client"))
+        assert store.get_client(ISSUER).client_id == "issuer-client"
+        raw = store._read_encrypted_file("clients.json")
+        assert set(raw) == {ISSUER, "resource:" + RESOURCE_B}
+        assert all("client_id" in v for v in raw.values())  # old from_dict still parses all
+
+    @pytest.mark.asyncio
+    async def test_preflight_post_with_open_sse_error_does_not_hang(self) -> None:
+        """R2-M4: plain .post() (stream=False) is read bounded too."""
+        result = {"jsonrpc": "2.0", "id": 0, "result": {"content": [], "isError": True}}
+
+        class OpenStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield f"event: message\ndata: {json.dumps(result)}\n\n".encode()
+                await asyncio.sleep(3600)
+                yield b""
+
+        def handler(request):
+            return httpx.Response(403, headers={"content-type": "text/event-stream"}, stream=OpenStream())
+
+        async def go():
+            async with McpHttpClient(transport=httpx.MockTransport(handler)) as c:
+                return await c.post(SERVER_URL, json=_rpc("initialize", 0))
+
+        r = await asyncio.wait_for(go(), 5)
+        assert r.status_code == 200 and r.json() == result
+
+    @pytest.mark.asyncio
+    async def test_large_error_body_is_capped(self) -> None:
+        def handler(request):
+            return httpx.Response(500, text="x" * 500_000)
+
+        r = await _send(handler, _rpc())
+        msg = r.json()["error"]["message"]
+        assert len(msg) < 1100 and msg.endswith("...")
+
+    @pytest.mark.asyncio
+    async def test_success_responses_untouched_both_modes(self) -> None:
+        def handler(request):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 7, "result": {"ok": True}})
+
+        async with McpHttpClient(transport=httpx.MockTransport(handler)) as c:
+            r1 = await c.post(SERVER_URL, json=_rpc())
+            r2 = await c.send(c.build_request("POST", SERVER_URL, json=_rpc()), stream=True)
+            body2 = json.loads(await r2.aread())
+        assert r1.json()["result"] == {"ok": True} and body2["result"] == {"ok": True}
+
+
+async def _run_login(flow: OAuthFlow) -> None:
+    callback = MagicMock()
+    callback.redirect_uri = "http://localhost:47391/callback"
+    callback.wait_for_callback = AsyncMock(
+        return_value=MagicMock(is_success=lambda: True, state="fixed-state", code="the-code")
+    )
+    cb_cm = MagicMock()
+    cb_cm.__aenter__ = AsyncMock(return_value=callback)
+    cb_cm.__aexit__ = AsyncMock(return_value=False)
+    cfg = _oauth_config()
+    cfg.resource_uri = flow.server_url
+    with (
+        patch.object(OAuthFlow, "discover", AsyncMock(return_value=cfg)),
+        patch("mcp_launchpad.oauth.flow.LocalhostCallbackServer", return_value=cb_cm),
+        patch("mcp_launchpad.oauth.flow.build_authorization_url", return_value="https://x"),
+        patch("mcp_launchpad.oauth.flow.generate_state", return_value="fixed-state"),
+        patch("mcp_launchpad.oauth.flow.webbrowser.open", return_value=True),
+        patch(
+            "mcp_launchpad.oauth.flow.exchange_code_for_tokens",
+            AsyncMock(return_value={"access_token": "at", "expires_in": 600, "refresh_token": "rt"}),
+        ),
+    ):
+        await flow.run()
+
+
+# ---------------------------------------------------------------------------
+# Real cross-process concurrency: N processes refresh one expired token at once
+# ---------------------------------------------------------------------------
+
+_CHILD = r'''
+import asyncio, json, os, sys, fcntl
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+store_dir, count_file, url, issuer = sys.argv[1:5]
+with patch("mcp_launchpad.oauth.store.keyring.get_password", side_effect=Exception("no keyring")):
+    from mcp_launchpad.oauth.store import TokenStore
+    store = TokenStore(store_dir=Path(store_dir))
+from mcp_launchpad.oauth import manager as mm
+async def fake_refresh(md, client, rt, resource):
+    with open(count_file, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX); f.write(rt + "\n"); f.flush(); fcntl.flock(f, fcntl.LOCK_UN)
+    await asyncio.sleep(0.5)
+    n = sum(1 for _ in open(count_file))
+    return {"access_token": f"at-{n}", "expires_in": 600, "refresh_token": f"rt-{n + 1}"}
+async def main():
+    m = mm.OAuthManager(_store=store)
+    cfg = MagicMock(); cfg.auth_server_metadata.issuer = issuer; cfg.resource_uri = url
+    m._oauth_configs[url] = cfg
+    with patch.object(mm, "refresh_token", fake_refresh):
+        t = await m.get_fresh_token(url)
+    print(json.dumps({"access": t.access_token, "rt": t.refresh_token}))
+asyncio.run(main())
+'''
+
+
+def test_parallel_processes_redeem_refresh_token_once(store, tmp_path) -> None:
+    import subprocess
+    import sys
+
+    store.set_client(ISSUER, ClientCredentials("cid"))
+    store.set_token(SERVER_URL, _token("old", -10, refresh="rt-1"))
+    count_file = tmp_path / "redeemed.txt"
+    count_file.touch()
+    script = tmp_path / "child.py"
+    script.write_text(_CHILD)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(store.store_dir), str(count_file), SERVER_URL, ISSUER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=tmp_path,
+        )
+        for _ in range(4)
+    ]
+    outs = []
+    for p in procs:
+        out, err = p.communicate(timeout=60)
+        assert p.returncode == 0, err
+        outs.append(json.loads(out.strip().splitlines()[-1]))
+    redeemed = count_file.read_text().split()
+    assert redeemed == ["rt-1"]  # the rotating refresh token was redeemed exactly once
+    assert {o["access"] for o in outs} == {"at-1"}
+    assert {o["rt"] for o in outs} == {"rt-2"}
+    assert store.get_token(SERVER_URL).refresh_token == "rt-2"
+
+
+# ---------------------------------------------------------------------------
+# Daemon background refresh threshold (round 1, M1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_background_refresh_skips_freshly_issued_short_token(store) -> None:
+    from mcp_launchpad import daemon as daemon_module
+
+    m = OAuthManager(_store=store)
+    m._oauth_configs[SERVER_URL] = _oauth_config()
+    store.set_client(ISSUER, ClientCredentials("cid"))
+    d = MagicMock()
+    refresh = _refresh_mock("new")
+    with (
+        patch.object(daemon_module, "get_oauth_manager", return_value=m),
+        patch.object(manager_module, "refresh_token", refresh),
+    ):
+        # 10-minute token issued just now: half-life threshold (300 s) not reached
+        store.set_token(SERVER_URL, _token("fresh", 590))
+        await daemon_module.Daemon._refresh_oauth_tokens_once(d)
+        refresh.assert_not_called()
+        # Same token with 4 minutes left: inside the threshold, refreshed once
+        aging = _token("aging", 240)
+        aging.issued_at = aging.expires_at - timedelta(seconds=600)  # lifetime 600, 4 min left
+        store.set_token(SERVER_URL, aging)
+        await daemon_module.Daemon._refresh_oauth_tokens_once(d)
+    assert refresh.await_count == 1

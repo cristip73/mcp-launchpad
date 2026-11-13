@@ -507,6 +507,56 @@ class TokenStore:
 
         logger.debug(f"Stored client credentials for {auth_server}")
 
+    # Clients are historically keyed by authorization server (issuer) only.
+    # Two MCP servers on one issuer can use different clients (one DCR, one
+    # configured), so the client that obtained a token is also stored under
+    # its resource. Older mcpl versions only read issuer keys and ignore
+    # these extra "resource:" entries.
+    _RESOURCE_CLIENT_PREFIX = "resource:"
+
+    def get_client_for_resource(self, resource: str) -> ClientCredentials | None:
+        """Get the client that obtained the token for a resource, if recorded."""
+        return self.get_client(self._RESOURCE_CLIENT_PREFIX + resource)
+
+    def set_client_for_resource(self, resource: str, client: ClientCredentials) -> None:
+        """Record the client that obtained the token for a resource."""
+        self.set_client(self._RESOURCE_CLIENT_PREFIX + resource, client)
+
+    def set_client_if_compatible(
+        self,
+        auth_server: str,
+        client: ClientCredentials,
+        replace_same_id: bool = False,
+    ) -> bool:
+        """Store an issuer client only if it cannot clobber another client.
+
+        Checked and written under one lock, so a concurrent process storing a
+        different client for the same issuer is never overwritten.
+
+        Args:
+            auth_server: The authorization server URL
+            client: The client credentials to store
+            replace_same_id: Also replace an entry with the same client_id
+                (e.g. a new secret at login); a different client_id is never
+                replaced
+
+        Returns:
+            True if written
+        """
+        key = self._normalize_resource(auth_server)
+
+        def _mutate(clients_data: dict[str, Any]) -> bool:
+            existing = clients_data.get(key)
+            if existing is None:
+                clients_data[key] = client.to_dict()
+                return True
+            if replace_same_id and existing.get("client_id") == client.client_id:
+                clients_data[key] = client.to_dict()
+                return True
+            return False
+
+        return self._update_encrypted_file(CLIENTS_FILE, _mutate)
+
     def delete_client(self, auth_server: str) -> bool:
         """Delete client credentials for an authorization server.
 

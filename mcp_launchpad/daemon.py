@@ -205,39 +205,38 @@ class Daemon:
         """Periodically refresh OAuth tokens before they expire."""
         while self.state.running:
             await asyncio.sleep(OAUTH_REFRESH_INTERVAL)
-            oauth_manager = get_oauth_manager()
-            for server_url in oauth_manager.list_authenticated_servers():
-                try:
-                    token = oauth_manager.get_token(server_url)
-                    if token is None or not token.has_refresh_token():
-                        continue
-                    # Refresh if expired or expiring soon. "Soon" is 10 minutes,
-                    # but at most half the token's lifetime: a 10-minute token
-                    # is otherwise "expiring soon" the moment it is issued, and
-                    # every daemon alive would redeem it again in turn. Live
-                    # sessions refresh on demand anyway (OAuthBearerAuth).
-                    threshold = 600
-                    if token.expires_at and token.issued_at:
-                        lifetime = (token.expires_at - token.issued_at).total_seconds()
-                        if lifetime > 0:
-                            threshold = int(min(threshold, lifetime / 2))
-                    needs_refresh = token.is_expired(buffer_seconds=threshold)
-                    if needs_refresh:
-                        # Re-checked under the refresh lock: skipped if another
-                        # process refreshed it meanwhile
-                        refreshed = await oauth_manager.refresh_proactively(
-                            server_url, min_remaining_seconds=threshold
-                        )
-                        if refreshed:
-                            logger.info(
-                                f"Proactively refreshed OAuth token for {server_url}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Failed to refresh OAuth token for {server_url}"
-                            )
-                except Exception as e:
-                    logger.debug(f"Error checking token for {server_url}: {e}")
+            await self._refresh_oauth_tokens_once()
+
+    async def _refresh_oauth_tokens_once(self) -> None:
+        """One pass of the periodic refresh over all stored tokens."""
+        oauth_manager = get_oauth_manager()
+        for server_url in oauth_manager.list_authenticated_servers():
+            try:
+                token = oauth_manager.get_token(server_url)
+                if token is None or not token.has_refresh_token():
+                    continue
+                # Refresh if expired or expiring soon. "Soon" is 10 minutes,
+                # but at most half the token's lifetime: a 10-minute token
+                # is otherwise "expiring soon" the moment it is issued, and
+                # every daemon alive would redeem it again in turn. Live
+                # sessions refresh on demand anyway (OAuthBearerAuth).
+                threshold = 600
+                if token.expires_at and token.issued_at:
+                    lifetime = (token.expires_at - token.issued_at).total_seconds()
+                    if lifetime > 0:
+                        threshold = int(min(threshold, lifetime / 2))
+                if token.is_expired(buffer_seconds=threshold):
+                    # Re-checked under the refresh lock: skipped if another
+                    # process refreshed it meanwhile
+                    refreshed = await oauth_manager.refresh_proactively(
+                        server_url, min_remaining_seconds=threshold
+                    )
+                    if refreshed:
+                        logger.info(f"Proactively refreshed OAuth token for {server_url}")
+                    else:
+                        logger.warning(f"Failed to refresh OAuth token for {server_url}")
+            except Exception as e:
+                logger.debug(f"Error checking token for {server_url}: {e}")
 
     async def _check_idle_servers(self) -> None:
         """Periodically check for idle servers and disconnect them."""
