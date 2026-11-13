@@ -1080,3 +1080,27 @@ class TestReviewRound4:
             assert await manager.refresh_if_needed(SERVER_URL, client_id="cid", client_secret="fresh")
         assert store.get_issuer_for_resource_client(SERVER_URL) == ISSUER
         assert store.get_client_for_resource(SERVER_URL).client_secret == "fresh"
+
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_refresh_upgrades_record_then_rotation_reaches_it(self, store) -> None:
+        """Codex r5 minor: backfill also on the unconfigured (background) refresh path."""
+        store.set_client_for_resource(RESOURCE_A, ClientCredentials("shared", "old-secret"))  # no issuer
+        m = OAuthManager(_store=store)
+        cfg_a = _oauth_config()
+        cfg_a.resource_uri = RESOURCE_A
+        m._oauth_configs[RESOURCE_A] = cfg_a
+        store.set_token(RESOURCE_A, _token("a-old", -10))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("a-1")):
+            assert await m.refresh_if_needed(RESOURCE_A)  # no client_id passed
+        assert store.get_issuer_for_resource_client(RESOURCE_A) == ISSUER
+
+        # Login on another resource of the same issuer rotates the shared secret
+        flow = OAuthFlow(server_url=RESOURCE_B, token_store=store, client_id="shared",
+                         client_secret="new-secret")
+        await _run_login(flow)
+        store.set_token(RESOURCE_A, _token("a-1", -10))
+        refresh = _refresh_mock("a-2")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await m.refresh_if_needed(RESOURCE_A)
+        assert refresh.await_args.args[1].client_secret == "new-secret"

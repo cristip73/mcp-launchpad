@@ -507,20 +507,22 @@ class OAuthManager:
         same client_id; an explicit (configured) secret is propagated to every
         stored record of that client_id.
         """
-        if not client_id:
-            return self._lookup_client(auth_server, resource)
-
         by_resource, by_issuer = self._client_records(auth_server, resource)
         if (
             by_resource is not None
             and self._store.get_issuer_for_resource_client(resource) is None
         ):
             # Record written without its issuer (earlier build): we know it now,
-            # and the scoped secret propagation below needs it.
+            # and scoped secret propagation (here or at a later login) needs it.
+            # Done before the unconfigured early return too (Codex r5 minor).
             try:
                 self._store.set_client_for_resource(resource, by_resource, issuer=auth_server)
             except Exception as e:  # pragma: no cover - best effort
                 logger.debug(f"Could not record issuer for {resource}: {e}")
+
+        if not client_id:
+            return self._lookup_client(auth_server, resource)
+
         same_id = [
             c for c in (by_resource, by_issuer) if c is not None and c.client_id == client_id
         ]
