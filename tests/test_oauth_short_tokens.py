@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from mcp_launchpad.http_client import ErrorBodyTransport, OAuthBearerAuth, build_http_client
+from mcp_launchpad.http_client import McpHttpClient, OAuthBearerAuth, build_http_client
 from mcp_launchpad.oauth import manager as manager_module
 from mcp_launchpad.oauth.flow import OAuthFlow
 from mcp_launchpad.oauth.manager import OAuthManager
@@ -358,14 +358,13 @@ def _rpc(method: str = "tools/call", rid: Any = 7) -> dict[str, Any]:
 
 
 async def _send(handler, payload: Any, method: str = "POST", headers=None) -> httpx.Response:
-    transport = ErrorBodyTransport(httpx.MockTransport(handler))
-    async with httpx.AsyncClient(transport=transport, headers=headers or {}) as c:
+    async with McpHttpClient(transport=httpx.MockTransport(handler), headers=headers or {}) as c:
         if method == "POST":
             return await c.post(SERVER_URL, json=payload)
         return await c.get(SERVER_URL)
 
 
-class TestErrorBodyTransport:
+class TestErrorBodyRewrite:
     @pytest.mark.asyncio
     async def test_text_error_becomes_jsonrpc_error(self) -> None:
         def handler(request):
@@ -506,7 +505,7 @@ class TestThroughSdk:
         from mcp.client.streamable_http import streamable_http_client
 
         handler, _ = _mcp_server(403, "[not_entitled] This item isn't included on your current plan.")
-        client = httpx.AsyncClient(transport=ErrorBodyTransport(httpx.MockTransport(handler)))
+        client = McpHttpClient(transport=httpx.MockTransport(handler))
         async with client:
             async with streamable_http_client(SERVER_URL, http_client=client, terminate_on_close=False) as t:
                 async with ClientSession(t[0], t[1]) as session:
@@ -528,7 +527,7 @@ class TestThroughSdk:
         store.set_token(SERVER_URL, _token("t1", 600))
 
         auth = OAuthBearerAuth(SERVER_URL, manager=manager)
-        client = httpx.AsyncClient(auth=auth, transport=ErrorBodyTransport(httpx.MockTransport(handler)))
+        client = McpHttpClient(auth=auth, transport=httpx.MockTransport(handler))
         with patch.object(manager_module, "refresh_token", _refresh_mock("t2")):
             async with client:
                 async with streamable_http_client(
@@ -543,3 +542,110 @@ class TestThroughSdk:
         assert getattr(result, "is_error", getattr(result, "isError", None)) is False
         assert seen[n_before:] == ["Bearer t1", "Bearer t2"]
         assert store.get_token(SERVER_URL).access_token == "t2"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (Codex) regressions
+# ---------------------------------------------------------------------------
+
+
+class TestReviewRound1:
+    @pytest.mark.asyncio
+    async def test_lock_timeout_fails_closed(self, store, manager, monkeypatch) -> None:
+        """B2: a lock held past the deadline must not lead to a second redemption."""
+        monkeypatch.setattr(manager_module, "REFRESH_LOCK_TIMEOUT", 0.3)
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        fd = os.open(store.store_dir / manager_module.REFRESH_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        refresh = _refresh_mock("x")
+        try:
+            with patch.object(manager_module, "refresh_token", refresh):
+                token = await manager.get_fresh_token(SERVER_URL)
+                assert await manager.refresh_proactively(SERVER_URL) is False
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        assert token.access_token == "old"
+        refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parsed_jsonrpc_bodies_are_redacted(self) -> None:
+        """B3: a JSON-RPC result/error echoing the bearer is redacted too."""
+        result = {"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": "got secret-abc"}], "isError": True}}
+        error = {"jsonrpc": "2.0", "id": 7, "error": {"code": -1, "message": "bad secret-abc"}}
+        for status, body in ((400, result), (403, error)):
+            r = await _send(lambda req, b=body, st=status: httpx.Response(st, json=b), _rpc(),
+                            headers={"Authorization": "Bearer secret-abc"})
+            assert "secret-abc" not in r.text
+            assert "[redacted]" in r.text
+
+    @pytest.mark.asyncio
+    async def test_401_with_jsonrpc_result_still_triggers_refresh(self, store, manager) -> None:
+        """B4: rewriting runs after auth, so the 401 is seen and retried."""
+        seen: list[str] = []
+        bad = {"jsonrpc": "2.0", "id": 7, "result": {"content": [], "isError": True}}
+        good = {"jsonrpc": "2.0", "id": 7, "result": {"content": [], "isError": False}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get("Authorization", ""))
+            if request.headers.get("Authorization") == "Bearer new":
+                return httpx.Response(200, json=good)
+            return httpx.Response(401, json=bad)
+
+        store.set_client(ISSUER, ClientCredentials("cid"))
+        store.set_token(SERVER_URL, _token("dead", 600))
+        with patch.object(manager_module, "refresh_token", _refresh_mock("new")):
+            auth = OAuthBearerAuth(SERVER_URL, manager=manager)
+            async with McpHttpClient(auth=auth, transport=httpx.MockTransport(handler)) as c:
+                r = await c.post(SERVER_URL, json=_rpc())
+        assert seen == ["Bearer dead", "Bearer new"]
+        assert r.status_code == 200 and r.json() == good
+
+    @pytest.mark.asyncio
+    async def test_final_401_keeps_status_even_with_result_body(self) -> None:
+        bad = {"jsonrpc": "2.0", "id": 7, "result": {"content": [], "isError": True}}
+        r = await _send(lambda req: httpx.Response(401, json=bad), _rpc())
+        assert r.status_code == 401
+        assert "error" in r.json()
+
+    def test_env_proxies_are_kept(self, monkeypatch) -> None:
+        """B5: no custom transport, so httpx still mounts HTTPS_PROXY."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+        client = build_http_client("s", SERVER_URL, {}, None, httpx.Timeout(5))
+        assert any("proxy" in repr(t).lower() or "proxy" in repr(vars(t)).lower()
+                   for t in client._mounts.values() if t is not None)
+
+    @pytest.mark.asyncio
+    async def test_configured_client_beats_other_servers_stored_client(self, store, manager) -> None:
+        """B6: another server's DCR client on the same issuer is not used for ours."""
+        store.set_client(ISSUER, ClientCredentials("dcr-client-of-server-a"))
+        store.set_token(SERVER_URL, _token("old", -10))
+        refresh = _refresh_mock("new")
+        with patch.object(manager_module, "refresh_token", refresh):
+            assert await manager.refresh_if_needed(SERVER_URL, client_id="configured-b")
+        assert refresh.await_args.args[1].client_id == "configured-b"
+        # Server A's stored client is left alone
+        assert store.get_client(ISSUER).client_id == "dcr-client-of-server-a"
+
+    @pytest.mark.asyncio
+    async def test_sse_error_stream_left_open_does_not_hang(self) -> None:
+        """M2: stop reading at the first JSON-RPC message."""
+        result = {"jsonrpc": "2.0", "id": 7, "result": {"content": [], "isError": True}}
+
+        class OpenStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield f"event: message\ndata: {json.dumps(result)}\n\n".encode()
+                await asyncio.sleep(3600)  # server never closes
+                yield b""
+
+        def handler(request):
+            return httpx.Response(403, headers={"content-type": "text/event-stream"}, stream=OpenStream())
+
+        async def go() -> httpx.Response:
+            # stream=True, as the MCP SDK sends (a plain post() reads to EOF first)
+            async with McpHttpClient(transport=httpx.MockTransport(handler)) as c:
+                return await c.send(c.build_request("POST", SERVER_URL, json=_rpc()), stream=True)
+
+        r = await asyncio.wait_for(go(), 5)
+        assert r.status_code == 200 and r.json() == result

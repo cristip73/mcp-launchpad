@@ -11,7 +11,7 @@ Two problems with long-lived MCP sessions over streamable HTTP live here:
 
 2. Swallowed server errors. For any HTTP status >= 400 whose body is not a
    JSON-RPC error, the MCP SDK replaces the body with the fixed text
-   "Server returned an error response". ``ErrorBodyTransport`` rewrites such
+   "Server returned an error response". ``McpHttpClient`` rewrites such
    bodies into a JSON-RPC error that carries the status and the server's own
    text, and passes JSON-RPC results sent with an error status through as 200.
 """
@@ -34,6 +34,8 @@ logger = logging.getLogger("mcpl.http")
 
 # How much of a non-JSON-RPC error body to surface to the caller
 ERROR_BODY_MAX_CHARS = int(os.environ.get("MCPL_ERROR_BODY_MAX_CHARS", "1000"))
+# Never buffer more than this of an error body
+ERROR_BODY_MAX_BYTES = 64 * 1024
 
 # JSON-RPC "internal error" code used for synthesized errors
 _INTERNAL_ERROR = -32603
@@ -161,80 +163,116 @@ def _parse_jsonrpc_body(body: bytes, content_type: str) -> dict[str, Any] | None
     return None
 
 
-def _redact(text: str, request: httpx.Request) -> str:
-    """Never echo the bearer credential back to the caller."""
-    auth = request.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        secret = auth[7:].strip()
-        if secret:
-            text = text.replace(secret, "[redacted]")
+def _bearer_secrets(response: httpx.Response) -> list[str]:
+    """Every bearer credential sent for this response (incl. auth retries)."""
+    secrets: list[str] = []
+    for resp in [*response.history, response]:
+        try:
+            auth = resp.request.headers.get("Authorization", "")
+        except RuntimeError:  # response without a request
+            continue
+        if auth.lower().startswith("bearer "):
+            secret = auth[7:].strip()
+            if secret and secret not in secrets:
+                secrets.append(secret)
+    return secrets
+
+
+def _redact(text: str, secrets: list[str]) -> str:
+    """Never echo a bearer credential back to the caller."""
+    for secret in secrets:
+        text = text.replace(secret, "[redacted]")
     return text
 
 
-class ErrorBodyTransport(httpx.AsyncBaseTransport):
-    """Keep the server's error text for JSON-RPC requests answered with >= 400."""
+async def _read_bounded(response: httpx.Response, content_type: str) -> bytes:
+    """Read an error body, at most ERROR_BODY_MAX_BYTES.
 
-    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
-        self._inner = inner or httpx.AsyncHTTPTransport()
+    An SSE body is parsed as it arrives and the read stops at the first
+    JSON-RPC message, so a stream the server keeps open does not hang us.
+    """
+    buf = bytearray()
+    is_sse = content_type.startswith("text/event-stream")
+    async for chunk in response.aiter_bytes():
+        buf += chunk
+        if len(buf) >= ERROR_BODY_MAX_BYTES:
+            break
+        if is_sse and _parse_jsonrpc_body(bytes(buf), content_type) is not None:
+            break
+    return bytes(buf[:ERROR_BODY_MAX_BYTES])
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        response = await self._inner.handle_async_request(request)
-        # 404 keeps its SDK meaning (session terminated / method not found)
-        if response.status_code < 400 or response.status_code == 404:
-            return response
-        is_request, request_id = _jsonrpc_request_id(request)
-        if not is_request:
-            return response
 
-        try:
-            body = await response.aread()
-        finally:
-            await response.aclose()
+async def rewrite_error_response(
+    request: httpx.Request, response: httpx.Response
+) -> httpx.Response:
+    """Keep the server's error text for a JSON-RPC request answered with >= 400.
 
-        content_type = response.headers.get("content-type", "").lower()
-        headers = [
-            (k, v) for k, v in response.headers.multi_items() if k.lower() not in _DROP_HEADERS
-        ]
-        headers.append(("content-type", "application/json"))
+    Runs after auth handling, so a 401 has already been refreshed and retried
+    (and a final 401 keeps its status for the OAuth-required check).
+    """
+    # 404 keeps its SDK meaning (session terminated / method not found)
+    if response.status_code < 400 or response.status_code == 404:
+        return response
+    is_request, request_id = _jsonrpc_request_id(request)
+    if not is_request:
+        return response
 
-        message = _parse_jsonrpc_body(body, content_type)
-        if message is not None:
-            if "result" in message:
-                # A full JSON-RPC result (often isError: true) sent with an
-                # error status: the SDK would drop it, so hand it over as 200.
-                return httpx.Response(
-                    200, headers=headers, content=json.dumps(message).encode(), request=request
-                )
-            # JSON-RPC error: the SDK already surfaces these at >= 400
-            return httpx.Response(
-                response.status_code,
-                headers=headers,
-                content=json.dumps(message).encode(),
-                request=request,
-            )
+    content_type = response.headers.get("content-type", "").lower()
+    try:
+        body = await _read_bounded(response, content_type)
+    finally:
+        await response.aclose()
 
-        text = _redact(body.decode("utf-8", errors="replace").strip(), request)
-        if len(text) > ERROR_BODY_MAX_CHARS:
-            text = text[:ERROR_BODY_MAX_CHARS] + "..."
-        reason = response.reason_phrase or ""
-        summary = f"HTTP {response.status_code}{(' ' + reason) if reason else ''}"
-        error = {
+    secrets = _bearer_secrets(response)
+    headers = [
+        (k, v) for k, v in response.headers.multi_items() if k.lower() not in _DROP_HEADERS
+    ]
+    headers.append(("content-type", "application/json"))
+
+    def _reply(status: int, payload: dict[str, Any]) -> httpx.Response:
+        content = _redact(json.dumps(payload), secrets).encode()
+        return httpx.Response(status, headers=headers, content=content, request=request)
+
+    message = _parse_jsonrpc_body(body, content_type)
+    if message is not None and response.status_code != 401:
+        if "result" in message:
+            # A full JSON-RPC result (often isError: true) sent with an
+            # error status: the SDK would drop it, so hand it over as 200.
+            return _reply(200, message)
+        # JSON-RPC error: the SDK already surfaces these at >= 400
+        return _reply(response.status_code, message)
+    if message is not None and "error" in message:
+        return _reply(response.status_code, message)
+
+    text = _redact(body.decode("utf-8", errors="replace").strip(), secrets)
+    if len(text) > ERROR_BODY_MAX_CHARS:
+        text = text[:ERROR_BODY_MAX_CHARS] + "..."
+    reason = response.reason_phrase or ""
+    summary = f"HTTP {response.status_code}{(' ' + reason) if reason else ''}"
+    return _reply(
+        response.status_code,
+        {
             "jsonrpc": "2.0",
             "id": request_id,
             "error": {
                 "code": _INTERNAL_ERROR,
                 "message": f"{summary}: {text}" if text else summary,
             },
-        }
-        return httpx.Response(
-            response.status_code,
-            headers=headers,
-            content=json.dumps(error).encode(),
-            request=request,
-        )
+        },
+    )
 
-    async def aclose(self) -> None:
-        await self._inner.aclose()
+
+class McpHttpClient(httpx.AsyncClient):
+    """httpx client that keeps server error text (see rewrite_error_response).
+
+    Done in ``send`` rather than in a custom transport: a custom transport
+    disables httpx's environment proxy routing, and ``send`` runs after the
+    auth flow, so 401 refresh/retry still sees the original response.
+    """
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        response = await super().send(request, **kwargs)
+        return await rewrite_error_response(request, response)
 
 
 def build_http_client(
@@ -259,9 +297,4 @@ def build_http_client(
             logger.debug(f"Using static API key for '{server_name}'")
         else:
             auth = OAuthBearerAuth(url, client_id=client_id, client_secret=client_secret)
-    return httpx.AsyncClient(
-        headers=headers,
-        auth=auth,
-        timeout=timeout,
-        transport=ErrorBodyTransport(),
-    )
+    return McpHttpClient(headers=headers, auth=auth, timeout=timeout)

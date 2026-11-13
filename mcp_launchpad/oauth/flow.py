@@ -732,15 +732,26 @@ class OAuthFlow:
                 # A configured (non-DCR) client must be stored too: refresh
                 # looks the client up in the store by authorization server,
                 # and without it every refresh fails with "No client credentials".
+                # Never overwrite a different client stored for the same issuer
+                # (another server's DCR client); refresh then falls back to
+                # the configured client id passed from the server config.
                 if self.client_id:
-                    self.token_store.set_client(
-                        oauth_config.auth_server_metadata.issuer,
-                        ClientCredentials(
-                            self.client_id,
-                            self.client_secret,
-                            redirect_uri=redirect_uri,
-                        ),
-                    )
+                    issuer = oauth_config.auth_server_metadata.issuer
+                    existing = self.token_store.get_client(issuer)
+                    if existing is None or existing.client_id == self.client_id:
+                        self.token_store.set_client(
+                            issuer,
+                            ClientCredentials(
+                                self.client_id,
+                                self.client_secret,
+                                redirect_uri=redirect_uri,
+                            ),
+                        )
+                    else:
+                        logger.warning(
+                            f"A different client is stored for {issuer}; keeping it. "
+                            f"Refresh for this server uses its configured oauth_client_id."
+                        )
 
                 self._emit_status("Successfully authenticated!")
 

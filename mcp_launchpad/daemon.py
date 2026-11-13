@@ -203,8 +203,6 @@ class Daemon:
 
     async def _refresh_oauth_tokens(self) -> None:
         """Periodically refresh OAuth tokens before they expire."""
-        from datetime import datetime, timedelta, timezone
-
         while self.state.running:
             await asyncio.sleep(OAUTH_REFRESH_INTERVAL)
             oauth_manager = get_oauth_manager()
@@ -213,17 +211,22 @@ class Daemon:
                     token = oauth_manager.get_token(server_url)
                     if token is None or not token.has_refresh_token():
                         continue
-                    # Refresh if expired or expiring within 10 minutes
-                    needs_refresh = token.is_expired()
-                    if not needs_refresh and token.expires_at:
-                        now = datetime.now(timezone.utc)
-                        expires_at = token.expires_at
-                        if expires_at.tzinfo is None:
-                            expires_at = expires_at.replace(tzinfo=timezone.utc)
-                        needs_refresh = (expires_at - now) < timedelta(minutes=10)
+                    # Refresh if expired or expiring soon. "Soon" is 10 minutes,
+                    # but at most half the token's lifetime: a 10-minute token
+                    # is otherwise "expiring soon" the moment it is issued, and
+                    # every daemon alive would redeem it again in turn. Live
+                    # sessions refresh on demand anyway (OAuthBearerAuth).
+                    threshold = 600
+                    if token.expires_at and token.issued_at:
+                        lifetime = (token.expires_at - token.issued_at).total_seconds()
+                        if lifetime > 0:
+                            threshold = int(min(threshold, lifetime / 2))
+                    needs_refresh = token.is_expired(buffer_seconds=threshold)
                     if needs_refresh:
+                        # Re-checked under the refresh lock: skipped if another
+                        # process refreshed it meanwhile
                         refreshed = await oauth_manager.refresh_proactively(
-                            server_url, min_remaining_seconds=600
+                            server_url, min_remaining_seconds=threshold
                         )
                         if refreshed:
                             logger.info(

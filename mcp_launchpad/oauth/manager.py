@@ -429,14 +429,16 @@ class OAuthManager:
     # ------------------------------------------------------------------
 
     @asynccontextmanager
-    async def _refresh_lock(self) -> AsyncIterator[None]:
+    async def _refresh_lock(self) -> AsyncIterator[bool]:
         """Hold the cross-process refresh lock (polling, never blocks the loop).
 
-        If the lock cannot be taken within REFRESH_LOCK_TIMEOUT seconds (a
-        stuck process), proceed without it rather than fail the request.
+        Yields True when the lock is held. If it cannot be taken within
+        REFRESH_LOCK_TIMEOUT seconds it yields False, and callers must NOT
+        redeem the refresh token (fail closed: another process is mid-refresh
+        and a second redemption could invalidate a rotating refresh token).
         """
-        if fcntl is None:  # pragma: no cover - Windows: in-process only
-            yield
+        if fcntl is None:  # pragma: no cover - Windows: no cross-process lock
+            yield True
             return
         lock_path = self._store.store_dir / REFRESH_LOCK_FILE
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -453,11 +455,11 @@ class OAuthManager:
                     if loop.time() >= deadline:
                         logger.warning(
                             "OAuth refresh lock busy for "
-                            f"{REFRESH_LOCK_TIMEOUT}s; refreshing without it"
+                            f"{REFRESH_LOCK_TIMEOUT}s; not refreshing this time"
                         )
                         break
                     await asyncio.sleep(0.1)
-            yield
+            yield locked
         finally:
             if locked:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -515,14 +517,21 @@ class OAuthManager:
             return None
 
         auth_server = oauth_config.auth_server_metadata.issuer
-        client = self._store.get_client(auth_server)
-        if client is None and client_id:
+        stored_client = self._store.get_client(auth_server)
+        client: ClientCredentials | None
+        if client_id:
+            # The server's configured client is authoritative for its tokens;
+            # the store keys clients by issuer only, and another server on the
+            # same issuer may have stored a different (e.g. DCR) client there.
             client = ClientCredentials(client_id, client_secret)
-            # Persist it so other processes (and `mcpl auth refresh`) can refresh too
-            try:
-                self._store.set_client(auth_server, client)
-            except Exception as e:  # pragma: no cover - best effort
-                logger.debug(f"Could not persist configured client for {auth_server}: {e}")
+            if stored_client is None:
+                # Persist it so processes without the config can refresh too
+                try:
+                    self._store.set_client(auth_server, client)
+                except Exception as e:  # pragma: no cover - best effort
+                    logger.debug(f"Could not persist configured client for {auth_server}: {e}")
+        else:
+            client = stored_client
         if client is None:
             logger.warning(
                 f"No client credentials for {auth_server}. Set oauth_client_id "
@@ -594,12 +603,12 @@ class OAuthManager:
         if not token.has_refresh_token():
             return token
 
-        async with self._refresh_lock():
+        async with self._refresh_lock() as locked:
             # Re-read under the lock: another process may have refreshed already
             token = self._lookup_token(server_url)
             if token is None or not self._needs_refresh(token, rejected_access_token):
                 return token
-            if not token.has_refresh_token():
+            if not token.has_refresh_token() or not locked:
                 return token
             new_token = await self._do_refresh(
                 server_url, token, client_id=client_id, client_secret=client_secret
@@ -657,9 +666,9 @@ class OAuthManager:
         if token is None or not token.has_refresh_token():
             return False
 
-        async with self._refresh_lock():
+        async with self._refresh_lock() as locked:
             token = self._lookup_token(server_url)
-            if token is None or not token.has_refresh_token():
+            if token is None or not token.has_refresh_token() or not locked:
                 return False
             if min_remaining_seconds is not None and not token.is_expired(
                 buffer_seconds=min_remaining_seconds
